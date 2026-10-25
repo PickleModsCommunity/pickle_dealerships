@@ -184,6 +184,12 @@ RegisterNetEvent('pickle_dealerships:startDeliveryMission', function(data)
     }
 
     SpawnMissionRig(pickupCoords, activeMission.trailerPlan, activeMission.vehicles)
+    CreateThread(function()
+        Wait(500)
+        if activeMission and activeMission.deliveryId==data.deliveryId and truckEntity and trailerEntity then
+            TriggerServerEvent('pickle_dealerships:bindDeliveryEntities',data.deliveryId,VehToNet(truckEntity),VehToNet(trailerEntity))
+        end
+    end)
     SpawnDropoffVisuals(dropoffCoords)
 
     -- Blip/waypoint routed to the drop-off point so drivers navigate straight to the trailer zone.

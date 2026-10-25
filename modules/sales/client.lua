@@ -119,6 +119,7 @@ RegisterNUICallback("purchaseVehicle", function(data, cb)
         paymentMethod = data.paymentMethod or "cash",
         color = data.color,
         couponCode = data.couponCode,
+        couponItemSlot=data.couponItemSlot,
         addons = data.addons,
     })
 
@@ -419,6 +420,9 @@ RegisterNUICallback("startTestDrive", function(data, cb)
     -- test-drive vehicle is created in the same instance. Everyone else at
     -- the dealership stays in the default bucket — no cross-player collisions
     -- during the drive.
+    if not lib.callback.await('pickle_dealerships:authorizeTestDrive',false,{dealershipId=dealershipId,model=model}) then
+        cb({success=false,message='Test drive authorization failed.'}); return
+    end
     TriggerServerEvent('pickle_dealerships:enterTestDriveBucket')
     Wait(200) -- let the server-side bucket change take effect
 
@@ -615,6 +619,7 @@ RegisterNetEvent("pickle_dealerships:confirmPurchase", function(data)
         stockId = data.stockId,
         paymentMethod = paymentMethod,
         couponCode = data.couponCode,
+        couponItemSlot=data.couponItemSlot,
         soldBy = data.soldBy,
         price = data.price,
     })

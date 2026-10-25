@@ -10,6 +10,7 @@
 -- player disconnect, or resource stop.
 
 local TEST_DRIVE_BUCKET_BASE = 90000
+local testDriveVersions = {}
 local originalBuckets = {} -- [src] = previous bucket id
 
 local function EnterTestDriveBucket(source)
@@ -18,6 +19,17 @@ local function EnterTestDriveBucket(source)
     local key = tostring(src)
     originalBuckets[src] = GetPlayerRoutingBucket(key)
     SetPlayerRoutingBucket(key, TEST_DRIVE_BUCKET_BASE + src)
+    testDriveVersions[src]=(testDriveVersions[src] or 0)+1
+    local version=testDriveVersions[src]
+    local owner=DealerIdentity(src)
+    SetTimeout(((tonumber(Config.TestDriveTime) or 120)+30)*1000,function()
+        if testDriveVersions[src]~=version or DealerIdentity(src)~=owner then return end
+        local previous=originalBuckets[src]
+        if previous~=nil then
+            if GetPlayerRoutingBucket(src)==TEST_DRIVE_BUCKET_BASE+src then SetPlayerRoutingBucket(src,previous) end
+            originalBuckets[src]=nil
+        end
+    end)
 end
 
 local function LeaveTestDriveBucket(source)
@@ -27,6 +39,7 @@ local function LeaveTestDriveBucket(source)
     if prev == nil then return end
     SetPlayerRoutingBucket(tostring(src), prev)
     originalBuckets[src] = nil
+    testDriveVersions[src]=(testDriveVersions[src] or 0)+1
 end
 
 RegisterNetEvent('pickle_dealerships:enterTestDriveBucket', function()
@@ -73,7 +86,9 @@ local function GetStockItem(stockId)
         "SELECT * FROM `pickle_dealership_stock` WHERE `id` = ? LIMIT 1",
         { tonumber(stockId) }
     )
-    return rows and rows[1] or nil
+    local row=rows and rows[1]
+    if row and row.auction_id then return nil end
+    return row
 end
 
 -- Global so other modules (financing, etc.) can reuse the same validation +
@@ -92,7 +107,7 @@ function ValidateCoupon(dealershipId, code, purchasePrice, identifier)
     -- max_uses = 0 means unlimited; only enforce the cap when a positive
     -- limit is set, otherwise every unlimited coupon would fail (0 >= 0).
     if coupon.max_uses and coupon.max_uses > 0 and coupon.uses >= coupon.max_uses then return nil end
-    if coupon.expires_at and os.time() > coupon.expires_at then return nil end
+    if coupon.expires_at and os.time() > DealerDate(coupon.expires_at) then return nil end
     if coupon.min_purchase > 0 and purchasePrice < coupon.min_purchase then return nil end
 
     -- Per-player cap. Only meaningful when we know which player is buying;
@@ -108,7 +123,7 @@ function ValidateCoupon(dealershipId, code, purchasePrice, identifier)
 
     local discount = 0
     local value = tonumber(coupon.discount_value) or 0
-    if coupon.discount_type == "percent" then
+    if (coupon.discount_type == "percent" or coupon.discount_type == "percentage") then
         -- Clamp percent to [0, 100] so a bad row can't produce a negative
         -- discount (which would inflate the price) or exceed the vehicle cost.
         local pct = math.max(0, math.min(100, value))
@@ -119,18 +134,8 @@ function ValidateCoupon(dealershipId, code, purchasePrice, identifier)
     -- Belt and braces: never let the discount exceed the price itself.
     if discount > purchasePrice then discount = purchasePrice end
 
-    -- Increment global uses
-    MySQL.update("UPDATE `pickle_dealership_coupons` SET `uses` = `uses` + 1 WHERE `id` = ?", { coupon.id })
-
-    -- And the per-player tally (UPSERT) so the next redemption from this
-    -- player sees the new total.
-    if identifier then
-        MySQL.update(
-            "INSERT INTO `pickle_dealership_coupon_uses` (`coupon_id`, `identifier`, `uses`) VALUES (?, ?, 1) " ..
-            "ON DUPLICATE KEY UPDATE `uses` = `uses` + 1, `last_used` = CURRENT_TIMESTAMP",
-            { coupon.id, identifier }
-        )
-    end
+    if not DealerCouponAllowed(coupon,DealerCurrentStock()) then return nil end
+    DealerQueueCoupon(coupon,identifier)
 
     return discount, coupon
 end
@@ -146,12 +151,12 @@ local function MarkStockSold(stockId, identifier, soldBy)
         return
     end
     if stock and stock.quantity > 1 then
-        MySQL.update(
+        MySQL.update.await(
             "UPDATE `pickle_dealership_stock` SET `quantity` = `quantity` - 1 WHERE `id` = ?",
             { tonumber(stockId) }
         )
     else
-        MySQL.update(
+        MySQL.update.await(
             "UPDATE `pickle_dealership_stock` SET `sold_at` = NOW(), `sold_to` = ?, `sold_by` = ? WHERE `id` = ?",
             { identifier, soldBy, tonumber(stockId) }
         )
@@ -304,7 +309,7 @@ local function ProcessSale(source, dealershipId, stockItem, paymentMethod, coupo
         if balance < finalPrice then
             return false, _L("error_society_insufficient")
         end
-        RemoveSocietyMoney(societyName, finalPrice)
+        if RemoveSocietyMoney(societyName,finalPrice)~=true then return false,"Society debit could not be confirmed" end
     else
         -- Cash / bank. Dealerships can disable either to force alt-currency sales
         -- (e.g. donator-only shops). Default both on when the flag is unset.
@@ -332,81 +337,7 @@ local function ProcessSale(source, dealershipId, stockItem, paymentMethod, coupo
         end
 
         -- Deduct money
-        RemoveMoney(source, finalPrice, currency)
-    end
-
-    -- Mark stock as sold
-    MarkStockSold(stockItem.id, identifier, soldByCitizenid)
-
-    -- Calculate tax and net revenue
-    local salesTax = math.floor(finalPrice * Config.SalesTax)
-    local netRevenue = finalPrice - salesTax
-
-    -- Add revenue to dealership balance
-    AddDealershipBalance(dealershipId, netRevenue)
-
-    -- Ledger: sale
-    local ledgerDesc = ("Vehicle sold: %s for %s"):format(stockItem.vehicle_label or stockItem.vehicle_model, GetCurrencyString(finalPrice))
-    if societyEntry then
-        ledgerDesc = ledgerDesc .. (" (society: %s:%s)"):format(societyEntry.type, societyEntry.name)
-    elseif altCurrencyUsed then
-        ledgerDesc = ledgerDesc .. (" (alt: %s x%d)"):format(altCurrencyUsed.key, altCurrencyUsed.native)
-    end
-    AddLedgerEntry(dealershipId, "sale", finalPrice, ledgerDesc, identifier)
-
-    -- Ledger: tax
-    if salesTax > 0 then
-        AddLedgerEntry(dealershipId, "tax", -salesTax, ("Sales tax on %s"):format(stockItem.vehicle_label or stockItem.vehicle_model), nil)
-    end
-
-    -- Commission
-    if soldByCitizenid then
-        -- Lookup priority: per-employee override → dealership grade-based rate (using the seller's
-        -- REAL framework job grade, never a synthetic role label) → Config.DefaultCommission.
-        local empRow = MySQL.single.await(
-            "SELECT `commission_rate` FROM `pickle_dealership_employees` WHERE `dealership_id` = ? AND `identifier` = ? LIMIT 1",
-            { tonumber(dealershipId), soldByCitizenid }
-        )
-
-        local commissionRate = Config.DefaultCommission or 0.08
-        local empOverride = empRow and tonumber(empRow.commission_rate)
-        if empOverride and empOverride > 0 then
-            -- DB stores percentage (0-100); normalise to decimal.
-            commissionRate = empOverride / 100
-        else
-            local meta = dealership and dealership.metadata
-            if type(meta) == "string" then meta = json.decode(meta) or {} end
-            if dealership and type(meta) == "table" and type(meta.commissionRates) == "table" and dealership.job and dealership.job ~= "" then
-                local sellerSource = GetSourceFromIdentifier(soldByCitizenid)
-                local sellerGrade = sellerSource and GetPlayerJobGrade and GetPlayerJobGrade(sellerSource) or nil
-                if sellerGrade then
-                    -- commissionRates is stored with string keys (JSON normalisation) keyed by level.
-                    local gradeRate = meta.commissionRates[tostring(sellerGrade)] or meta.commissionRates[sellerGrade]
-                    if gradeRate then
-                        commissionRate = tonumber(gradeRate) / 100
-                    end
-                end
-            end
-        end
-
-        -- Commission is a percentage of PROFIT (sale price minus what the
-        -- dealership paid for the unit), not of the sale price itself. Losses
-        -- on a sale yield no commission.
-        local wholesaleCost = tonumber(stockItem.wholesale_cost) or 0
-        local profit = math.max(0, finalPrice - wholesaleCost)
-        local commission = math.floor(profit * commissionRate)
-        if commission > 0 then
-            -- Deduct commission from dealership balance
-            AddDealershipBalance(dealershipId, -commission)
-
-            -- Pay the salesperson
-            local sellerSource = GetSourceFromIdentifier(soldByCitizenid)
-            if sellerSource then
-                AddMoney(sellerSource, commission, "bank")
-            end
-
-            AddLedgerEntry(dealershipId, "commission", -commission, ("Commission to salesperson for %s"):format(stockItem.vehicle_label or stockItem.vehicle_model), soldByCitizenid)
-        end
+        if RemoveMoney(source,finalPrice,currency)~=true then return false,"Payment rejected" end
     end
 
     -- Register vehicle with a single, authoritative plate
@@ -464,7 +395,81 @@ local function ProcessSale(source, dealershipId, stockItem, paymentMethod, coupo
             props.color2 = chosen
         end
     end
-    AddOwnedVehicleWithProps(source, stockItem.vehicle_model, plate, props)
+    if AddOwnedVehicleWithProps(source,stockItem.vehicle_model,plate,props)~=true then error('Vehicle ownership insert rejected') end
+    DealerGrantedVehicle(source,plate)
+
+
+    -- Mark stock as sold
+    MarkStockSold(stockItem.id, identifier, soldByCitizenid)
+
+    -- Calculate tax and net revenue
+    local salesTax = math.floor(finalPrice * Config.SalesTax)
+    local netRevenue = finalPrice - salesTax
+
+    -- Add revenue to dealership balance
+    AddDealershipBalance(dealershipId, netRevenue)
+
+    -- Ledger: sale
+    local ledgerDesc = ("Vehicle sold: %s for %s"):format(stockItem.vehicle_label or stockItem.vehicle_model, GetCurrencyString(finalPrice))
+    if societyEntry then
+        ledgerDesc = ledgerDesc .. (" (society: %s:%s)"):format(societyEntry.type, societyEntry.name)
+    elseif altCurrencyUsed then
+        ledgerDesc = ledgerDesc .. (" (alt: %s x%d)"):format(altCurrencyUsed.key, altCurrencyUsed.native)
+    end
+    AddLedgerEntry(dealershipId, "sale", finalPrice, ledgerDesc, identifier)
+
+    -- Ledger: tax
+    if salesTax > 0 then
+        AddLedgerEntry(dealershipId, "tax", -salesTax, ("Sales tax on %s"):format(stockItem.vehicle_label or stockItem.vehicle_model), nil)
+    end
+
+    -- Commission
+    if soldByCitizenid and soldByCitizenid~=identifier then
+        -- Lookup priority: per-employee override → dealership grade-based rate (using the seller's
+        -- REAL framework job grade, never a synthetic role label) → Config.DefaultCommission.
+        local empRow = MySQL.single.await(
+            "SELECT `commission_rate` FROM `pickle_dealership_employees` WHERE `dealership_id` = ? AND `identifier` = ? LIMIT 1",
+            { tonumber(dealershipId), soldByCitizenid }
+        )
+
+        local commissionRate = Config.DefaultCommission or 0.08
+        local empOverride = empRow and tonumber(empRow.commission_rate)
+        if empOverride and empOverride > 0 then
+            -- DB stores percentage (0-100); normalise to decimal.
+            commissionRate = empOverride / 100
+        else
+            local meta = dealership and dealership.metadata
+            if type(meta) == "string" then meta = json.decode(meta) or {} end
+            if dealership and type(meta) == "table" and type(meta.commissionRates) == "table" and dealership.job and dealership.job ~= "" then
+                local sellerSource = GetSourceFromIdentifier(soldByCitizenid)
+                local sellerGrade = sellerSource and GetPlayerJobGrade and GetPlayerJobGrade(sellerSource) or nil
+                if sellerGrade then
+                    -- commissionRates is stored with string keys (JSON normalisation) keyed by level.
+                    local gradeRate = meta.commissionRates[tostring(sellerGrade)] or meta.commissionRates[sellerGrade]
+                    if gradeRate then
+                        commissionRate = tonumber(gradeRate) / 100
+                    end
+                end
+            end
+        end
+
+        -- Commission is a percentage of PROFIT (sale price minus what the
+        -- dealership paid for the unit), not of the sale price itself. Losses
+        -- on a sale yield no commission.
+        local wholesaleCost = tonumber(stockItem.wholesale_cost) or 0
+        local profit = math.max(0, finalPrice - wholesaleCost)
+        local commission = math.floor(profit * commissionRate)
+        if commission > 0 then
+            -- Deduct commission from dealership balance
+            AddDealershipBalance(dealershipId, -commission)
+
+            -- Pay the salesperson
+            local sellerSource = GetSourceFromIdentifier(soldByCitizenid)
+            DealerCredit(soldByCitizenid,commission,"bank","commission:"..stockItem.id..":"..identifier)
+
+            AddLedgerEntry(dealershipId, "commission", -commission, ("Commission to salesperson for %s"):format(stockItem.vehicle_label or stockItem.vehicle_model), soldByCitizenid)
+        end
+    end
 
     -- Notify
     -- Award dealership XP (progression / auto-tier).
@@ -752,6 +757,8 @@ lib.callback.register("pickle_dealerships:employeeSale", function(source, data)
         stockItem.retail_price = salePrice
     end
 
+    DealerOffers[targetPlayerId]={dealershipId=dealershipId,stockId=stockId,price=stockItem.retail_price,couponCode=couponCode,
+        soldBy=sellerCitizenid,buyer=GetIdentifier(targetPlayerId),expires=os.time()+120}
     -- Trigger confirmation on the target player's client
     TriggerClientEvent("pickle_dealerships:confirmPurchase", targetPlayerId, {
         dealershipId = dealershipId,
@@ -860,7 +867,10 @@ end)
 --- player can't escalate it into anything else.
 RegisterNetEvent("pickle_dealerships:saleDeclined", function(data)
     local source = source
-    local soldBy = data and data.soldBy
+    local offer=DealerOffers[source]
+    if not offer or offer.buyer~=GetIdentifier(source) then return end
+    DealerOffers[source]=nil
+    local soldBy = offer.soldBy
     if type(soldBy) ~= "string" or soldBy == "" then return end
     local sellerSrc = GetSourceFromIdentifier and GetSourceFromIdentifier(soldBy) or nil
     if not sellerSrc then return end

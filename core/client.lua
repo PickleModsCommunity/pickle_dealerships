@@ -6,7 +6,9 @@ local ScriptEntities = {
 
 function CreateVeh(modelHash, ...)
     RequestModel(modelHash)
-    while not HasModelLoaded(modelHash) do Wait(0) end
+    local deadline=GetGameTimer()+5000
+    while not HasModelLoaded(modelHash) and GetGameTimer()<deadline do Wait(0) end
+    if not HasModelLoaded(modelHash) then return nil end
     local veh = CreateVehicle(modelHash, ...)
     SetModelAsNoLongerNeeded(modelHash)
     ScriptEntities["vehicles"][veh] = true
@@ -16,7 +18,9 @@ end
 function CreateNPC(modelHash, ...)
     if not IsModelInCdimage(modelHash) then return CreateNPC(`a_m_m_skater_01`, ...) end
     RequestModel(modelHash)
-    while not HasModelLoaded(modelHash) do Wait(0) end
+    local deadline=GetGameTimer()+5000
+    while not HasModelLoaded(modelHash) and GetGameTimer()<deadline do Wait(0) end
+    if not HasModelLoaded(modelHash) then return nil end
     local ped = CreatePed(26, modelHash, ...)
     SetModelAsNoLongerNeeded(modelHash)
     ScriptEntities["peds"][ped] = true
@@ -26,7 +30,9 @@ end
 function CreateProp(modelHash, ...)
     RequestModel(modelHash)
     if not IsModelInCdimage(modelHash) then return CreateProp(`ch_prop_fingerprint_scanner_error_01b`, ...) end
-    while not HasModelLoaded(modelHash) do Wait(0) end
+    local deadline=GetGameTimer()+5000
+    while not HasModelLoaded(modelHash) and GetGameTimer()<deadline do Wait(0) end
+    if not HasModelLoaded(modelHash) then return nil end
     local obj = CreateObject(modelHash, ...)
     SetModelAsNoLongerNeeded(modelHash)
     ScriptEntities["props"][obj] = true

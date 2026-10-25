@@ -152,8 +152,11 @@ function RunConversionImport(resource, version, selections, options)
     options = options or {}
     selections = selections or {}
 
+    local mapKey='conversion-map:'..resource..':'..version
+    local saved=GetResourceKvpString(mapKey)
+    local decoded,map=pcall(json.decode,saved or '{}')
     local ctx = {
-        legacyIdMap = {}, -- shared: source_dealership_id → pickle_dealerships.id
+        legacyIdMap = decoded and type(map)=='table' and map or {}, -- shared: source_dealership_id → pickle_dealerships.id
         options = options,
     }
 
@@ -175,7 +178,15 @@ function RunConversionImport(resource, version, selections, options)
         local ids = selections[key]
         if type(ids) == 'table' and #ids > 0 then
             local entity = adapter.entities[key]
-            local ok, res = pcall(entity.import, ids, options, ctx)
+            local fresh={}; local receipts={}
+            for _,id in ipairs(ids) do
+                local receipt='conversion:'..resource..':'..version..':'..key..':'..tostring(id)
+                if not GetResourceKvpString(receipt) then fresh[#fresh+1]=id; receipts[#receipts+1]=receipt; SetResourceKvp(receipt,'pending') end
+            end
+            local ok,res=true,{inserted=0,skipped=#ids,notFound={}}
+            if #fresh>0 then ok,res=pcall(entity.import,fresh,options,ctx) end
+            if ok and type(res)=='table' and not res.error then for _,receipt in ipairs(receipts) do SetResourceKvp(receipt,'done') end end
+            SetResourceKvp(mapKey,json.encode(ctx.legacyIdMap))
             if ok and type(res) == 'table' then
                 results[key] = res
             else
@@ -184,6 +195,8 @@ function RunConversionImport(resource, version, selections, options)
         end
     end
 
+    BackfillCatalogGroups()
+    LoadDealerships()
     return { success = true, results = results }
 end
 

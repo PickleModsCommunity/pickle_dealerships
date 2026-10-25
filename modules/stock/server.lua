@@ -404,7 +404,7 @@ lib.callback.register('pickle_dealerships:getStock', function(source, locationKe
         -- to one card with summed quantity. ANY_VALUE picks a representative
         -- for the columns that vary within a group; MIN(ds.id) gives the row
         -- mutations (set price, set min grade, etc.) will target.
-        local groupBy = 'ds.vehicle_model, ds.retail_price'
+        local groupBy = 'ds.id, ds.vehicle_model, ds.retail_price'
         local countParams = { table.unpack(params) }
         total = MySQL.scalar.await(
             ('SELECT COUNT(*) FROM (SELECT 1 FROM pickle_dealership_stock ds LEFT JOIN pickle_wholesale_catalog wc ON wc.model = ds.vehicle_model WHERE %s GROUP BY %s) sub'):format(where, groupBy),
@@ -598,6 +598,7 @@ end
 --- Returns: { unitCost, totalCost, deliveryFee, retailPrice } (all integers, per-order totals).
 function ResolveOwnerOrderCost(mode, wholesalePrice, retailPrice, qty)
     mode = NormalizeDeliveryMode(mode)
+    if mode=="instant" then mode="expedited" end
     local importTax = Config.ImportTax or 0
     local cfg = Config.Delivery or {}
     local unitCost, deliveryFee = 0, 0
@@ -609,7 +610,7 @@ function ResolveOwnerOrderCost(mode, wholesalePrice, retailPrice, qty)
         -- or surcharge. The driver's payout is tracked separately and routed
         -- through the earnings pipeline when the run is fulfilled.
         unitCost = wholesalePrice
-        deliveryFee = math.floor(retailPrice * (cfg.payoutPct or 0))
+        deliveryFee = math.floor(retailPrice * qty * (cfg.payoutPct or 0))
     end
 
     unitCost = math.floor(unitCost)
@@ -1235,18 +1236,24 @@ lib.callback.register('pickle_dealerships:tradeInVehicle', function(source, loca
     local catalog = MySQL.single.await('SELECT label FROM pickle_wholesale_catalog WHERE model = ?', { model })
     local label = (catalog and catalog.label) or model
 
-    -- Deduct from dealership balance
-    MySQL.update.await('UPDATE pickle_dealerships SET balance = balance - ? WHERE id = ?', { buyPrice, dealership.id })
+    if GetIdentifier(sellerSource)~=sellerIdentifier then return false,'Seller session changed.' end
+    local currentOwner=GetOwnedVehicleFromPlate(plate)
+    if not currentOwner or currentOwner.owner~=sellerIdentifier then return false,'Ownership changed.' end
+    if RemoveOwnedVehicle(sellerIdentifier,plate)~=true then return false,'Ownership removal failed.' end
+    if MySQL.update.await('UPDATE pickle_dealerships SET balance=balance-? WHERE id=? AND balance>=?',{buyPrice,dealership.id,buyPrice})~=1 then
+        DealerRestoreVehicle(sellerIdentifier,model,plate,props)
+        return false,'Insufficient dealership funds.'
+    end
 
     -- Pay the seller (consent already confirmed above)
-    AddMoney(sellerSource, buyPrice, 'bank')
+    -- Seller payment is queued only after stock insertion succeeds.
     ShowNotification(sellerSource, _L('stock_trade_in_seller', label, GetCurrencyString(buyPrice)))
 
     -- Remove ownership from the seller's framework records
-    RemoveOwnedVehicle(sellerIdentifier, plate)
+    -- Ownership was claimed before the dealership debit.
 
     -- Insert pre-owned stock row (captured vehicle properties stored in metadata)
-    local stockId = MySQL.insert.await(
+    local inserted,stockId=pcall(MySQL.insert.await,
         'INSERT INTO pickle_dealership_stock (dealership_id, vehicle_model, vehicle_label, wholesale_cost, retail_price, ordered_at, delivered_at, quantity, is_used, metadata, plate, acquired_from, `condition`) VALUES (?, ?, ?, ?, ?, NOW(), NOW(), 1, 1, ?, ?, ?, ?)',
         {
             dealership.id, model, label, buyPrice, retailPrice,
@@ -1254,6 +1261,12 @@ lib.callback.register('pickle_dealerships:tradeInVehicle', function(source, loca
         }
     )
 
+    if not inserted or not stockId then
+        DealerRestoreVehicle(sellerIdentifier,model,plate,props)
+        MySQL.update.await('UPDATE pickle_dealerships SET balance=balance+? WHERE id=?',{buyPrice,dealership.id})
+        return false,'Trade-in stock insertion failed; ownership recovery queued.'
+    end
+    DealerCredit(sellerIdentifier,buyPrice,'bank' ,'trade-in:'..tostring(stockId))
     AddLedgerEntry(dealership.id, 'expense', -buyPrice, 'Trade-in: ' .. label .. ' (' .. plate .. ')', identifier)
 
     ShowNotification(source, _L('stock_trade_in_buyer', label, GetCurrencyString(buyPrice)))
@@ -1316,7 +1329,7 @@ lib.callback.register('pickle_dealerships:seizeVehicle', function(source, data)
 
     -- Prefer the framework-stored model name, but fall back to the client-supplied
     -- name (resolved from the entity hash) when the bridge doesn't persist the model.
-    local model = owned.model
+    local model = type(owned.model)=='string' and owned.model or nil
     if (not model or model == '') and data.modelName and data.modelName ~= '' then
         model = tostring(data.modelName):lower()
     end
@@ -1339,7 +1352,7 @@ lib.callback.register('pickle_dealerships:seizeVehicle', function(source, data)
     local previousOwner = nil
     if owned and owned.owner then
         previousOwner = owned.owner
-        RemoveOwnedVehicle(owned.owner, plate)
+        if RemoveOwnedVehicle(owned.owner, plate)~=true then return false,'Ownership removal failed.' end
     end
 
     -- Cancel any active financing on this vehicle (no refund — the player loses the vehicle)
@@ -1363,7 +1376,7 @@ lib.callback.register('pickle_dealerships:seizeVehicle', function(source, data)
     end
 
     -- Insert as unlisted pre-owned stock (no cost to dealership)
-    local stockId = MySQL.insert.await(
+    local inserted,stockId=pcall(MySQL.insert.await,
         'INSERT INTO pickle_dealership_stock (dealership_id, vehicle_model, vehicle_label, wholesale_cost, retail_price, ordered_at, delivered_at, quantity, is_used, unlisted, metadata, plate, acquired_from, `condition`) VALUES (?, ?, ?, 0, 0, NOW(), NOW(), 1, 1, 1, ?, ?, ?, ?)',
         {
             dealership.id, model, label,
@@ -1371,7 +1384,12 @@ lib.callback.register('pickle_dealerships:seizeVehicle', function(source, data)
         }
     )
 
-    AddLedgerEntry(dealership.id, 'seize', 0, 'Seized: ' .. label .. ' (' .. plate .. ')' .. (previousOwner and (' from ' .. previousOwner) or ''), identifier)
+    if not inserted or not stockId then
+        DealerRestoreVehicle(previousOwner,model,plate,props)
+        if activeLoan then MySQL.update.await("UPDATE pickle_dealership_financing SET status='active' WHERE id=?",{activeLoan.id}) end
+        return false,'Seizure could not be committed; ownership recovery queued.'
+    end
+    AddLedgerEntry(dealership.id, 'seize' , 0, 'Seized: ' .. label .. ' (' .. plate .. ')' .. (previousOwner and (' from ' .. previousOwner) or ''), identifier)
 
     ShowNotification(source, _L('seize_success', label, plate))
     TriggerClientEvent('pickle_dealerships:refreshDisplay', -1, dealership.location)
@@ -1390,37 +1408,10 @@ end)
 
 --- On-demand: process any delivered orders for a dealership
 --- Moves delivered orders from pickle_dealership_orders into pickle_dealership_stock (stacking onto existing stock)
-function ProcessDeliveredOrders(dealershipId)
-    local completed = MySQL.query.await(
-        'SELECT * FROM pickle_dealership_orders WHERE dealership_id = ? AND delivered_at IS NOT NULL AND delivered_at <= NOW()',
-        { dealershipId }
-    )
-    if not completed or #completed == 0 then return false end
-
-    for _, order in ipairs(completed) do
-        -- Try to stack onto existing stock of the same model
-        local existing = MySQL.single.await(
-            'SELECT id FROM pickle_dealership_stock WHERE dealership_id = ? AND vehicle_model = ? AND sold_at IS NULL AND display_spot IS NULL AND is_used = 0 AND (`condition` = 100.00 OR `condition` IS NULL) ORDER BY id ASC LIMIT 1',
-            { dealershipId, order.vehicle_model }
-        )
-        if existing then
-            MySQL.update.await('UPDATE pickle_dealership_stock SET quantity = quantity + ? WHERE id = ?', { order.quantity, existing.id })
-        else
-            local orderedAtSql
-            if type(order.ordered_at) == 'number' then
-                orderedAtSql = os.date('%Y-%m-%d %H:%M:%S', math.floor(order.ordered_at / 1000))
-            elseif type(order.ordered_at) == 'string' and order.ordered_at ~= '' then
-                orderedAtSql = order.ordered_at
-            else
-                orderedAtSql = os.date('%Y-%m-%d %H:%M:%S')
-            end
-            MySQL.insert.await(
-                'INSERT INTO pickle_dealership_stock (dealership_id, vehicle_model, vehicle_label, wholesale_cost, retail_price, ordered_at, delivered_at, quantity) VALUES (?, ?, ?, ?, ?, ?, NOW(), ?)',
-                { dealershipId, order.vehicle_model, order.vehicle_label, order.wholesale_cost, order.retail_price, orderedAtSql, order.quantity }
-            )
-        end
-        MySQL.update.await('DELETE FROM pickle_dealership_orders WHERE id = ?', { order.id })
-    end
-
-    return true
+function ProcessDeliveredOrders(id)
+    return DealerRunMutation(function()
+        local rows=MySQL.query.await('SELECT id FROM pickle_dealership_orders WHERE dealership_id=? AND delivered_at IS NOT NULL AND delivered_at<=NOW() AND claimed_by IS NULL',{id}) or {}
+        local ids={}; for _,row in ipairs(rows) do ids[#ids+1]=row.id end
+        return DealerCommitOrders(ids)
+    end)
 end

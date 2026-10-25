@@ -13,7 +13,7 @@ end
 function GetIdentifier(source)
     local xPlayer = ESX.GetPlayerFromId(source)
     if not xPlayer or not xPlayer.identifier then return end
-    return xPlayer.identifier
+    return xPlayer and xPlayer.identifier
 end
 
 function GetSourceFromIdentifier(identifier)
@@ -55,19 +55,14 @@ function GetCharacterNameByIdentifier(identifier)
     return trim((row.firstname or "") .. " " .. (row.lastname or ""))
 end
 
-function GetEmployees(jobName, cb)
-    local employees = {}
-    local xPlayers = ESX.GetExtendedPlayers("job", jobName)
-    for _, xPlayer in pairs(xPlayers) do
-        employees[#employees + 1] = {
-            source = xPlayer.source,
-            name = xPlayer.getName(),
-            grade = xPlayer.job.grade,
-            gradeLabel = xPlayer.job.grade_label or ("Grade " .. xPlayer.job.grade),
-            online = true,
-        }
+function GetEmployees(jobName,cb)
+    local rows=MySQL.query.await('SELECT identifier,firstname,lastname,job_grade FROM users WHERE job=?',{jobName}) or {}
+    local employees={}
+    for _,row in ipairs(rows) do
+        local src=GetSourceFromIdentifier(row.identifier)
+        employees[#employees+1]={identifier=row.identifier,source=src,name=(row.firstname or '')..' '..(row.lastname or ''),grade=row.job_grade,online=src~=nil}
     end
-    if type(cb) == "function" then cb(employees) end
+    if type(cb)=='function' then cb(employees) end
     return employees
 end
 
@@ -113,7 +108,10 @@ end
 
 function AddMoney(source, count, currency)
     local xPlayer = ESX.GetPlayerFromId(source)
+    if not xPlayer then return false end
     local currency = currency or "money"
+    local before=GetMoney(source,currency)
+    if not DealerInt(count,0,2147483647) then return false end
     if (currency == "money") then
         xPlayer.addMoney(count)
     elseif (currency == "dirty") then
@@ -122,11 +120,15 @@ function AddMoney(source, count, currency)
         xPlayer.addAccountMoney("bank", count)
     end
     TriggerClientEvent("pickle_dealerships:updateMoney", source, GetMoney(source, currency))
+    return GetMoney(source,currency)==before + count
 end
 
 function RemoveMoney(source, count, currency)
     local xPlayer = ESX.GetPlayerFromId(source)
+    if not xPlayer then return false end
     local currency = currency or "money"
+    local before=GetMoney(source,currency)
+    if not DealerInt(count,0,2147483647) or before<count then return false end
     if (currency == "money") then
         xPlayer.removeMoney(count)
     elseif (currency == "dirty") then
@@ -135,6 +137,7 @@ function RemoveMoney(source, count, currency)
         xPlayer.removeAccountMoney("bank", count)
     end
     TriggerClientEvent("pickle_dealerships:updateMoney", source, GetMoney(source, currency))
+    return GetMoney(source,currency)==before - count
 end
 
 function GetMoney(source, currency)
@@ -165,42 +168,32 @@ function GetOwnedVehicleFromPlate(plate)
             model = props.modelName or props.model_name or nil
         end
     end
-    return { owner = data.owner, model = model }
-end
-
-function AddOwnedVehicle(source, plate, model)
-    local xPlayer = ESX.GetPlayerFromId(source)
-    MySQL.Async.execute("INSERT INTO owned_vehicles (owner, plate, vehicle) VALUES (@owner, @plate, @vehicle);", {
-        ['@owner'] = xPlayer.identifier,
-        ['@plate'] = plate,
-        ['@vehicle'] = json.encode({
-            plate = toupper(plate),
-            model = joaat(model),
-        }),
-    })
+    return { owner = data.owner, model = model, properties=data.vehicle }
 end
 
 function AddOwnedVehicleWithProps(source, model, plate, properties)
     local xPlayer = ESX.GetPlayerFromId(source)
     if not xPlayer or not plate then return false end
+    local changed=0
     local props = type(properties) == "table" and properties or (type(properties) == "string" and json.decode(properties) or {})
-    props.plate = string.upper(plate)
+    props.plate = DealerPlate(plate)
     props.model = joaat(model)
-    MySQL.Async.execute("INSERT INTO owned_vehicles (owner, plate, vehicle) VALUES (@owner, @plate, @vehicle);", {
+    props.modelName=model
+    changed=MySQL.update.await("INSERT INTO owned_vehicles (owner, plate, vehicle) VALUES (@owner, @plate, @vehicle);", {
         ['@owner'] = xPlayer.identifier,
-        ['@plate'] = string.upper(plate),
+        ['@plate'] = DealerPlate(plate),
         ['@vehicle'] = json.encode(props),
     })
-    return true
+    return changed==1
 end
 
 function RemoveOwnedVehicle(identifier, plate)
     if not identifier or not plate then return false end
-    MySQL.Async.execute("DELETE FROM owned_vehicles WHERE owner=@owner AND plate=@plate;", {
+    local changed=MySQL.update.await("DELETE FROM owned_vehicles WHERE owner=@owner AND plate=@plate;", {
         ['@owner'] = identifier,
         ['@plate'] = plate,
     })
-    return true
+    return changed==1
 end
 
 function UpdateVehiclePlate(source, plate, newPlate)

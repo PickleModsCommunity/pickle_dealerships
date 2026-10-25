@@ -44,7 +44,7 @@ end)
 
 RegisterNetEvent('esx:playerLoaded')
 AddEventHandler('esx:playerLoaded',function(xPlayer, isNew, skin)
-    TriggerServerEvent("pickle_clubs:initializePlayer")
+    TriggerServerEvent("pickle_dealerships:initializePlayer")
 end)
 
 -- Inventory Fallback
@@ -60,12 +60,12 @@ CreateThread(function()
     
     Inventory.Ready = false
     
-    RegisterNetEvent("pickle_clubs:setupInventory", function(data)
+    RegisterNetEvent("pickle_dealerships:setupInventory", function(data)
         Inventory.Items = data.items
         Inventory.Ready = true
     end)
     
-    RegisterNetEvent("pickle_clubs:updateInventory", function(inventory) 
+    RegisterNetEvent("pickle_dealerships:updateInventory", function(inventory)
         -- RefreshInventory(inventory)
     end)
 end)

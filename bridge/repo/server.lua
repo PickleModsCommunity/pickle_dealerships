@@ -110,6 +110,14 @@ local function repossessVehicle(plate, opts)
     return PerformRepossession(financing, opts or {})
 end
 
-exports('getRepoCandidates', getRepoCandidates)
-exports('getFinancingByPlate', getFinancingByPlate)
-exports('repossessVehicle', repossessVehicle)
+local function authorized(fn)
+    return function(...)
+        local caller=GetInvokingResource()
+        if not caller or not ServerConfig.RepoResources[caller] then return nil,'Resource is not authorized for repossession access.' end
+        local args=table.pack(...)
+        return DealerRunMutation(function() return fn(table.unpack(args,1,args.n)) end)
+    end
+end
+exports('getRepoCandidates', authorized(getRepoCandidates))
+exports('getFinancingByPlate', authorized(getFinancingByPlate))
+exports('repossessVehicle', authorized(repossessVehicle))

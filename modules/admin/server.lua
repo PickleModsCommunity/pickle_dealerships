@@ -242,7 +242,7 @@ lib.callback.register("pickle_dealerships:adminResetDealership", function(source
     -- Wipe all related data. Tier column is left intact (legacy / unread) but
     -- group assignments are cleared so a fresh-after-reset dealership picks up
     -- whatever the admin assigns next.
-    MySQL.update.await("UPDATE pickle_dealerships SET owner_id = NULL, balance = 0, reputation = 0 WHERE id = ?", { dealershipId })
+    MySQL.update.await("UPDATE pickle_dealerships SET owner_identifier = NULL, balance = 0, reputation = 0 WHERE id = ?", { dealershipId })
     MySQL.update.await("DELETE FROM pickle_dealership_groups WHERE dealership_id = ?", { dealershipId })
     MySQL.update.await("DELETE FROM pickle_dealership_employees WHERE dealership_id = ?", { dealershipId })
     MySQL.update.await("DELETE FROM pickle_dealership_stock WHERE dealership_id = ?", { dealershipId })
@@ -251,7 +251,7 @@ lib.callback.register("pickle_dealerships:adminResetDealership", function(source
     MySQL.update.await("DELETE FROM pickle_dealership_coupons WHERE dealership_id = ?", { dealershipId })
 
     UpdateDealershipCache(dealershipId, {
-        owner_id   = nil,
+        owner_identifier   = nil,
         balance    = 0,
         reputation = 0,
     })

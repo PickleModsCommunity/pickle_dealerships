@@ -10,15 +10,12 @@ local function GetStockItem(stockId)
         "SELECT * FROM `pickle_dealership_stock` WHERE `id` = ? LIMIT 1",
         { tonumber(stockId) }
     )
-    return rows and rows[1] or nil
+    local row=rows and rows[1]
+    if row and row.auction_id then return nil end
+    return row
 end
 
-local function MarkStockSold(stockId, identifier, soldBy)
-    MySQL.update(
-        "UPDATE `pickle_dealership_stock` SET `sold_at` = NOW(), `sold_to` = ?, `sold_by` = ? WHERE `id` = ?",
-        { identifier, soldBy, tonumber(stockId) }
-    )
-end
+local function MarkStockSold(id,buyer,seller) return DealerMarkStockSold(id,buyer,seller) end
 
 local function AddDealershipBalance(dealershipId, amount)
     MySQL.update.await(
@@ -109,7 +106,7 @@ lib.callback.register("pickle_dealerships:updateFinancingSettings", function(sou
     if not dealershipId then return false, "Invalid request." end
 
     local role = GetPlayerDealershipRole(source, dealershipId)
-    if role ~= 'owner' and role ~= 'admin' then
+    if role ~= 'owner' and not IsPlayerAdmin(source) then
         return false, "Only owners can change financing settings."
     end
 
@@ -244,6 +241,7 @@ lib.callback.register("pickle_dealerships:createFinancing", function(source, dat
         end
         price = math.max(0, price - couponDiscount)
     end
+    if not DealerInt(downPayment,0,2147483647) or downPayment>=price then ReleaseStockLock(stockId); return {success=false,message="Down payment must leave a positive loan balance"} end
     local minDown = math.floor(price * settings.minDownPercent / 100)
 
     if downPayment < minDown then
@@ -309,17 +307,7 @@ lib.callback.register("pickle_dealerships:createFinancing", function(source, dat
     local installmentAmount = math.ceil(totalWithInterest / installments)
 
     -- Deduct down payment + addon cost from the selected account
-    RemoveMoney(source, upfrontTotal, paymentMethod)
-
-    -- Sales tax
-    local salesTax = math.floor(price * (Config.SalesTax or 0))
-    local netDownPayment = downPayment - math.floor(downPayment * (Config.SalesTax or 0))
-
-    -- Add-on revenue (custom plate fee, etc.) goes straight to the
-    -- dealership balance — no commission, no sales tax handling.
-    AddDealershipBalance(dealershipId, netDownPayment + addonCost)
-    MarkStockSold(stockId, identifier, nil)
-    ReleaseStockLock(stockId)
+    if RemoveMoney(source,upfrontTotal,paymentMethod)~=true then ReleaseStockLock(stockId); return {success=false,message="Payment rejected"} end
 
     -- Register vehicle with a single, authoritative plate (matches the sales flow
     -- so GetOwnedVehicleFromPlate resolves correctly for repossession / seize).
@@ -336,13 +324,25 @@ lib.callback.register("pickle_dealerships:createFinancing", function(source, dat
         plate = customPlate or GeneratePlate()
         properties = { plate = plate }
     end
-    AddOwnedVehicleWithProps(source, stockItem.vehicle_model, plate, properties)
+    if AddOwnedVehicleWithProps(source,stockItem.vehicle_model,plate,properties)~=true then error("Vehicle ownership insert rejected") end
+    DealerGrantedVehicle(source,plate)
+
+
+    -- Sales tax
+    local salesTax = math.floor(price * (Config.SalesTax or 0))
+    local netDownPayment = downPayment - math.floor(downPayment * (Config.SalesTax or 0))
+
+    -- Add-on revenue (custom plate fee, etc.) goes straight to the
+    -- dealership balance — no commission, no sales tax handling.
+    AddDealershipBalance(dealershipId, netDownPayment + addonCost)
+    MarkStockSold(stockId, identifier, nil)
+    ReleaseStockLock(stockId)
 
     -- Calculate next payment time
     local paymentIntervalSeconds = (settings.paymentIntervalHours or 24) * 3600
     local nextPaymentTimestamp = os.time() + paymentIntervalSeconds
 
-    MySQL.insert(
+    MySQL.insert.await(
         "INSERT INTO `pickle_dealership_financing` (`dealership_id`, `identifier`, `vehicle_plate`, `total_amount`, `amount_paid`, `installment_amount`, `interest_rate`, `next_payment`, `status`) VALUES (?, ?, ?, ?, ?, ?, ?, FROM_UNIXTIME(?), 'active')",
         {
             dealershipId,
@@ -433,13 +433,13 @@ lib.callback.register("pickle_dealerships:makePayment", function(source, data)
     local nextPaymentTimestamp = os.time() + paymentIntervalSeconds
 
     if fullyPaid then
-        MySQL.update(
+        MySQL.update.await(
             "UPDATE `pickle_dealership_financing` SET `amount_paid` = ?, `status` = 'paid', `missed_payments` = 0 WHERE `id` = ?",
             { newAmountPaid, financingId }
         )
         AddLedgerEntry(financing.dealership_id, "financing_payment", paymentAmount, ("Final financing payment for plate %s"):format(financing.vehicle_plate), identifier)
     else
-        MySQL.update(
+        MySQL.update.await(
             "UPDATE `pickle_dealership_financing` SET `amount_paid` = ?, `next_payment` = FROM_UNIXTIME(?), `missed_payments` = 0 WHERE `id` = ?",
             { newAmountPaid, nextPaymentTimestamp, financingId }
         )
@@ -497,7 +497,7 @@ lib.callback.register("pickle_dealerships:getDealershipFinancingAgreements", fun
     if not dealershipId then return {} end
 
     local role = GetPlayerDealershipRole(source, dealershipId)
-    if role ~= 'owner' and role ~= 'admin' then return {} end
+    if role ~= 'owner' and not IsPlayerAdmin(source) then return {} end
 
     local rows = MySQL.query.await(
         "SELECT * FROM `pickle_dealership_financing` WHERE `dealership_id` = ? ORDER BY `status` ASC, `created_at` DESC",
@@ -515,7 +515,7 @@ lib.callback.register("pickle_dealerships:forgiveLoan", function(source, data)
     if not financingId or not dealershipId then return false, "Invalid request." end
 
     local role = GetPlayerDealershipRole(source, dealershipId)
-    if role ~= 'owner' and role ~= 'admin' then
+    if role ~= 'owner' and not IsPlayerAdmin(source) then
         return false, "Only owners can forgive loans."
     end
 
@@ -525,7 +525,7 @@ lib.callback.register("pickle_dealerships:forgiveLoan", function(source, data)
     )
     if not rows or not rows[1] then return false, "Agreement not found." end
 
-    MySQL.update(
+    MySQL.update.await(
         "UPDATE `pickle_dealership_financing` SET `status` = 'paid', `amount_paid` = `total_amount`, `missed_payments` = 0 WHERE `id` = ?",
         { financingId }
     )
@@ -554,7 +554,7 @@ function PerformRepossession(financing, opts)
         or (tonumber(financing.missed_payments) or 0) + (opts.fromAutoCheck and 1 or 0)
         or 0
 
-    MySQL.update(
+    MySQL.update.await(
         "UPDATE `pickle_dealership_financing` SET `status` = 'repossessed', `missed_payments` = ? WHERE `id` = ?",
         { newMissed, financing.id }
     )
@@ -618,7 +618,7 @@ CreateThread(function()
                     local paymentIntervalSeconds = (settings.paymentIntervalHours or 24) * 3600
                     local nextPaymentTimestamp = now + paymentIntervalSeconds
 
-                    MySQL.update(
+                    MySQL.update.await(
                         "UPDATE `pickle_dealership_financing` SET `missed_payments` = ?, `next_payment` = FROM_UNIXTIME(?) WHERE `id` = ?",
                         { newMissed, nextPaymentTimestamp, financing.id }
                     )
