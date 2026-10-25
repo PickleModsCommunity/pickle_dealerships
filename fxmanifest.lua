@@ -2,7 +2,7 @@ fx_version "cerulean"
 game "gta5"
 author "Pickle Mods"
 description "The best player-owned dealership system for FiveM."
-version "v1.2.5"
+version "v1.2.6"
 
 ui_page "nui/index.html"
 
