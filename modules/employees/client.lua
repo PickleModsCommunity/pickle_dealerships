@@ -75,3 +75,7 @@ end)
 RegisterNetEvent("pickle_dealerships:customerArrived", function(data)
     ShowNotification(_L("employee_customer_arrived"))
 end)
+
+lib.callback.register('pickle_dealerships:confirmEmployment',function(data)
+    return lib.alertDialog({header='Employment offer',content='Join '..tostring(data.name)..' at grade '..tostring(data.grade)..'?',cancel=true})=='confirm'
+end)

@@ -469,7 +469,7 @@ lib.callback.register("pickle_dealerships:completeNPCSale", function(source, dat
     local netToDealership = adjustedAmount - commission
 
     local newBalance = (dealership.balance or 0) + netToDealership
-    MySQL.update("UPDATE pickle_dealerships SET balance = ? WHERE id = ?", { newBalance, dealershipId })
+    MySQL.update.await("UPDATE pickle_dealerships SET balance=balance+? WHERE id=?",{netToDealership,dealershipId})
     UpdateDealershipCache(dealershipId, { balance = newBalance })
 
     if commission > 0 then
@@ -549,12 +549,12 @@ lib.callback.register("pickle_dealerships:completeNPCSale", function(source, dat
     -- Update dealership reputation
     local repGain = (Config.NPCCustomers.reputationPerSale or 1) + bonusRep
     local newRep = (dealership.reputation or 0) + repGain
-    MySQL.update("UPDATE pickle_dealerships SET reputation = ? WHERE id = ?", { newRep, dealershipId })
+    MySQL.update.await("UPDATE pickle_dealerships SET reputation = ? WHERE id = ?", { newRep, dealershipId })
     UpdateDealershipCache(dealershipId, { reputation = newRep })
 
     -- Add ledger entry
     local playerName = GetPlayerCharacterName(source) or "Unknown"
-    AddLedgerEntry(dealershipId, "npc_sale", adjustedAmount, "NPC sale by " .. playerName .. " (Commission: " .. GetCurrencyString(commission) .. ")", identifier)
+    -- The sale and commission were already recorded above.
 
     -- Progression XP for the dealership (NPC sales are worth less than real-player sales).
     if AwardDealershipXP then

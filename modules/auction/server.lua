@@ -42,24 +42,11 @@ local function UnlockStock(stockId)
     MySQL.update.await("UPDATE `pickle_dealership_stock` SET `auction_id` = NULL WHERE `id` = ?", { tonumber(stockId) })
 end
 
-local function RefundBidder(identifier, amount, note, method)
-    if not identifier or not amount or amount <= 0 then return end
-    -- Refund in whatever the bidder paid with. Bank is the safe default for
-    -- legacy rows that predate payment_method tracking and for offline bidders
-    -- (always refund to bank so the money can't be lost in a closed cash
-    -- inventory). NOTE: the framework bridge's AddMoney/RemoveMoney expect
-    -- the currency code "money" for cash (not "cash") — passing "cash" falls
-    -- through the bridge's if/elseif chain and silently does nothing, which
-    -- is exactly how cash refunds were being lost.
-    local currency = method == 'cash' and 'money' or 'bank'
-    local src = GetSourceFromIdentifier(identifier)
-    if src then
-        AddMoney(src, amount, currency)
-        TriggerClientEvent('pickle_dealerships:notify', src, (note or 'Bid refunded') .. ': $' .. amount)
-    else
-        -- Offline: mark an unrefunded row so the escrow is still tracked; next pickup-on-connect handler can sweep.
-        -- For simplicity we insert a synthetic ledger-style row via the bids table refunded flag logic handled by caller.
-    end
+local function RefundBidder(identifier,amount,note,method,auctionId)
+    if not identifier or not DealerInt(tonumber(amount),1,2147483647) then return false end
+    -- The caller runs under the mutation lock, so the current unrefunded bid uniquely identifies the credit.
+    local bid=MySQL.single.await('SELECT id FROM pickle_dealership_auction_bids WHERE auction_id=? AND bidder_identifier=? AND amount=? ORDER BY id DESC LIMIT 1',{auctionId,identifier,amount})
+    return DealerCredit(identifier,amount,method=='cash' and 'money' or 'bank','auction-refund:'..tostring(bid and bid.id or identifier..':'..amount..':'..os.time()))
 end
 
 local function AddDealershipBalance(dealershipId, amount)
@@ -134,99 +121,41 @@ end)
 
 -- ─── Bidding ────────────────────────────────────────────────────────────────
 
-lib.callback.register("pickle_dealerships:placeBid", function(source, data)
-    local auctionId = tonumber(data and data.auctionId)
-    local amount = math.floor(tonumber(data and data.amount) or 0)
-    if not auctionId or amount <= 0 then return false, "Invalid bid." end
-
-    local identifier = GetIdentifier(source)
-    if not identifier then return false, "Could not identify player." end
-
-    local auction = FetchAuction(auctionId)
-    if not auction then return false, "Auction not found." end
-    if auction.status ~= 'active' then return false, "Auction is no longer active." end
-    -- NOTE: seller self-bidding is allowed for debugging/testing
-
-    -- Validate amount
-    local floor = auction.current_bid and (tonumber(auction.current_bid) + tonumber(auction.min_increment)) or tonumber(auction.starting_bid)
-    if amount < floor then return false, ("Bid must be at least $%d."):format(floor) end
-
-    -- Clamp to buyout (if they bid >= buyout, treat as buyout)
-    local isBuyout = auction.buyout_price and amount >= tonumber(auction.buyout_price) or false
-    if isBuyout then amount = tonumber(auction.buyout_price) end
-
-    -- Resolve payment method. Default to bank to match legacy behaviour.
-    local paymentMethod = data.paymentMethod == 'cash' and 'cash' or 'bank'
-    local currency = paymentMethod == 'cash' and 'money' or 'bank'
-
-    -- Pre-check balance so we never leave a bidder at a negative balance. The
-    -- framework's RemoveMoney does not consistently reject overdrafts (qbx
-    -- returns true on insufficient funds depending on config), so gating here
-    -- is the only reliable check.
-    local playerBalance = tonumber(GetMoney(source, currency)) or 0
-    if playerBalance < amount then
-        return false, ("Insufficient %s balance."):format(paymentMethod)
+lib.callback.register('pickle_dealerships:placeBid',function(src,data)
+    local id=tonumber(data and data.auctionId); local amount=tonumber(data and data.amount)
+    if not DealerInt(id,1,2147483647) or not DealerInt(amount,1,2147483647) then return false,'Invalid bid' end
+    local a=FetchAuction(id)
+    if not a or a.status~='active' or a.current_bidder and a.ends_at and DealerDate(a.ends_at)<=os.time() then return false,'Auction has ended' end
+    local current=tonumber(a.current_bid) or 0
+    local floor=a.current_bidder and current+tonumber(a.min_increment or 1) or tonumber(a.starting_bid or 0)
+    if amount<floor then return false,'Bid is below the current minimum' end
+    local buyout=a.buyout_price and tonumber(a.buyout_price)>0 and amount>=tonumber(a.buyout_price)
+    if buyout then amount=tonumber(a.buyout_price) end
+    local currency=data.paymentMethod=='cash' and 'money' or 'bank'
+    local owner=GetIdentifier(src)
+    if RemoveMoney(src,amount,currency)~=true then return false,'Insufficient funds' end
+    local queries={
+        {query='INSERT INTO pickle_dealership_auction_bids (auction_id,bidder_identifier,amount,payment_method) VALUES (?,?,?,?)',values={id,owner,amount,data.paymentMethod=='cash' and 'cash' or 'bank'}},
+        {query=[[
+            UPDATE pickle_dealership_auctions SET
+              ends_at=CASE WHEN ?=1 THEN NOW() WHEN ?=1 THEN DATE_ADD(NOW(),INTERVAL ? MINUTE)
+                 WHEN TIMESTAMPDIFF(SECOND,NOW(),ends_at)<? THEN DATE_ADD(NOW(),INTERVAL ? SECOND) ELSE ends_at END,
+              current_bid=?,current_bidder=?,current_payment_method=? WHERE id=? AND status='active'
+        ]],values={buyout and 1 or 0,a.current_bidder and 0 or 1,tonumber(a.duration_minutes) or Config.Auction.defaultDuration,
+            Config.Auction.antiSnipeSeconds or 0,Config.Auction.antiSnipeSeconds or 0,amount,owner,data.paymentMethod=='cash' and 'cash' or 'bank',id}},
+    }
+    local previous
+    if a.current_bidder and current>0 then
+        previous=MySQL.single.await('SELECT id FROM pickle_dealership_auction_bids WHERE auction_id=? AND bidder_identifier=? AND amount=? ORDER BY id DESC LIMIT 1',{id,a.current_bidder,current})
+        if not previous then AddMoney(src,amount,currency); return false,'Previous escrow receipt is unavailable' end
+        queries[#queries+1]={query="INSERT IGNORE INTO pickle_dealership_credits (credit_key,identifier,amount,currency,state) VALUES (?,?,?,?,'pending')",values={'auction-refund:'..previous.id,a.current_bidder,current,a.current_payment_method=='cash' and 'money' or 'bank'}}
+        queries[#queries+1]={query='UPDATE pickle_dealership_auction_bids SET refunded=1 WHERE id=?',values={previous.id}}
     end
-
-    -- Escrow: pull from the chosen tender
-    local removed = RemoveMoney(source, amount, currency)
-    if not removed then return false, ("Insufficient %s balance."):format(paymentMethod) end
-
-    -- Refund previous top bidder in whatever method they paid with
-    if auction.current_bidder and auction.current_bid and auction.current_bid > 0 then
-        MySQL.update.await(
-            "UPDATE `pickle_dealership_auction_bids` SET `refunded` = 1 WHERE `auction_id` = ? AND `bidder_identifier` = ? AND `refunded` = 0",
-            { auctionId, auction.current_bidder }
-        )
-        RefundBidder(auction.current_bidder, tonumber(auction.current_bid), 'Outbid', auction.current_payment_method)
-    end
-
-    -- Insert bid + update auction
-    MySQL.insert.await(
-        "INSERT INTO `pickle_dealership_auction_bids` (auction_id, bidder_identifier, amount, payment_method) VALUES (?, ?, ?, ?)",
-        { auctionId, identifier, amount, paymentMethod }
-    )
-
-    -- First bid starts the timer; subsequent bids may extend via anti-snipe
-    local isFirstBid = auction.current_bidder == nil
-    local timerStarted = false
-    local extended = false
-    if isFirstBid then
-        MySQL.update.await(
-            "UPDATE `pickle_dealership_auctions` SET `ends_at` = DATE_ADD(NOW(), INTERVAL ? MINUTE) WHERE `id` = ?",
-            { tonumber(auction.duration_minutes) or Config.Auction.defaultDuration, auctionId }
-        )
-        timerStarted = true
-    elseif not isBuyout and Config.Auction.antiSnipeSeconds and Config.Auction.antiSnipeSeconds > 0 then
-        local secondsLeft = MySQL.scalar.await(
-            "SELECT TIMESTAMPDIFF(SECOND, NOW(), `ends_at`) FROM `pickle_dealership_auctions` WHERE `id` = ?",
-            { auctionId }
-        )
-        if secondsLeft and tonumber(secondsLeft) < Config.Auction.antiSnipeSeconds then
-            MySQL.update.await(
-                "UPDATE `pickle_dealership_auctions` SET `ends_at` = DATE_ADD(NOW(), INTERVAL ? SECOND) WHERE `id` = ?",
-                { Config.Auction.antiSnipeSeconds, auctionId }
-            )
-            extended = true
-        end
-    end
-
-    MySQL.update.await(
-        "UPDATE `pickle_dealership_auctions` SET `current_bid` = ?, `current_bidder` = ?, `current_payment_method` = ? WHERE `id` = ?",
-        { amount, identifier, paymentMethod, auctionId }
-    )
-
-    -- Buyout finalizes the auction immediately
-    if isBuyout then
-        -- Finalizer will pick it up on next tick; cut end_at to now so there's no delay.
-        MySQL.update.await("UPDATE `pickle_dealership_auctions` SET `ends_at` = NOW() WHERE `id` = ?", { auctionId })
-    end
-
-    BroadcastAuctionUpdate(auctionId)
-    return true, { amount = amount, extended = extended, buyout = isBuyout, timerStarted = timerStarted }
+    if not MySQL.transaction.await(queries) then AddMoney(src,amount,currency); return false,'Bid could not be committed' end
+    if previous then DealerCredit(a.current_bidder,current,a.current_payment_method=='cash' and 'money' or 'bank','auction-refund:'..previous.id) end
+    BroadcastAuctionUpdate(id)
+    return true,{amount=amount,buyout=buyout,timerStarted=not a.current_bidder}
 end)
-
--- ─── Cancel ──────────────────────────────────────────────────────────────────
 
 lib.callback.register("pickle_dealerships:cancelAuction", function(source, data)
     local auctionId = tonumber(data and data.auctionId)
@@ -293,7 +222,7 @@ lib.callback.register("pickle_dealerships:claimAuctionVehicle", function(source,
     if row.winner_identifier ~= identifier then return false, "You are not the winner." end
     if row.claimed_at then return false, "Already claimed." end
 
-    MySQL.update.await("UPDATE `pickle_dealership_auctions` SET `claimed_at` = NOW() WHERE `id` = ?", { auctionId })
+    if MySQL.update.await("UPDATE pickle_dealership_auctions SET claimed_at=NOW() WHERE id=? AND claimed_at IS NULL AND status='won'",{auctionId})~=1 then return false,"Already claimed" end
     MySQL.update.await(
         "UPDATE `pickle_dealership_stock` SET `sold_at` = NOW(), `sold_to` = ?, `sold_by` = ?, `auction_id` = NULL WHERE `id` = ?",
         { identifier, 'auction', row.stock_id }
@@ -313,7 +242,11 @@ lib.callback.register("pickle_dealerships:claimAuctionVehicle", function(source,
     end
     props.plate = plate
 
-    AddOwnedVehicleWithProps(source, row.vehicle_model, plate, props)
+    if AddOwnedVehicleWithProps(source,row.vehicle_model,plate,props)~=true then
+        MySQL.update.await("UPDATE pickle_dealership_auctions SET claimed_at=NULL WHERE id=?",{auctionId})
+        return false,'Vehicle ownership insert failed'
+    end
+    DealerGrantedVehicle(source,plate)
 
     -- If caller requested garage-only delivery, skip spawn
     local toGarage = data.toGarage == true
@@ -388,54 +321,47 @@ end)
 
 -- ─── Finalizer thread ────────────────────────────────────────────────────────
 
-local function FinalizeAuction(row)
-    local auctionId = row.id
-    local hasBid = row.current_bid and row.current_bid > 0
-    local reserveMet = (row.reserve_price == nil) or (hasBid and tonumber(row.current_bid) >= tonumber(row.reserve_price))
-
-    if not hasBid or not reserveMet then
-        -- No sale: refund top bidder if any, unlock stock
-        if hasBid then
-            MySQL.update.await(
-                "UPDATE `pickle_dealership_auction_bids` SET `refunded` = 1 WHERE `auction_id` = ? AND `bidder_identifier` = ? AND `refunded` = 0",
-                { auctionId, row.current_bidder }
-            )
-            RefundBidder(row.current_bidder, tonumber(row.current_bid), 'Reserve not met', row.current_payment_method)
-        end
-        MySQL.update.await(
-            "UPDATE `pickle_dealership_auctions` SET `status` = 'no_sale', `ended_at` = NOW() WHERE `id` = ?",
-            { auctionId }
-        )
-        UnlockStock(row.stock_id)
+local function FinalizeAuctionUnsafe(row)
+    local bid=tonumber(row.current_bid) or 0
+    local won=bid>0 and (not row.reserve_price or bid>=tonumber(row.reserve_price))
+    local queries={{query='INSERT INTO pickle_dealership_auction_receipts (auction_id) VALUES (?)',values={row.id}}}
+    local creditKey
+    local net=0
+    if won then
+        local cut=math.max(0,math.min(1,tonumber(Config.Auction.houseCutPct) or 0))
+        net=bid-math.floor(bid*cut)
+        queries[#queries+1]={query='UPDATE pickle_dealerships SET balance=balance+? WHERE id=?',values={net,row.dealership_id}}
+        queries[#queries+1]={query="UPDATE pickle_dealership_auctions SET status='won',ended_at=NOW(),winner_identifier=?,winning_bid=? WHERE id=?",values={row.current_bidder,bid,row.id}}
     else
-        -- Won: credit seller dealership (minus house cut), mark winner
-        local winningBid = tonumber(row.current_bid)
-        local housePct = tonumber(Config.Auction.houseCutPct) or 0.0
-        local houseCut = math.floor(winningBid * housePct)
-        local net = winningBid - houseCut
-
-        AddDealershipBalance(row.dealership_id, net)
-        AddLedgerEntry(row.dealership_id, 'auction_sale', net,
-            ('Auction win — stock #%d for $%d (cut $%d)'):format(row.stock_id, winningBid, houseCut),
-            row.current_bidder)
-
-        MySQL.update.await(
-            [[UPDATE `pickle_dealership_auctions`
-              SET `status` = 'won', `ended_at` = NOW(),
-                  `winner_identifier` = ?, `winning_bid` = ?
-              WHERE `id` = ?]],
-            { row.current_bidder, winningBid, auctionId }
-        )
-
-        -- Notify winner if online
-        local winnerSrc = GetSourceFromIdentifier(row.current_bidder)
-        if winnerSrc then
-            TriggerClientEvent('pickle_dealerships:notify', winnerSrc,
-                ('You won auction #%d for $%d! Pick up at the selling dealership.'):format(auctionId, winningBid))
+        queries[#queries+1]={query="UPDATE pickle_dealership_auctions SET status='no_sale',ended_at=NOW() WHERE id=?",values={row.id}}
+        queries[#queries+1]={query='UPDATE pickle_dealership_stock SET auction_id=NULL WHERE id=?',values={row.stock_id}}
+        if bid>0 and row.current_bidder then
+            creditKey='auction-reserve:'..row.id
+            queries[#queries+1]={query="INSERT IGNORE INTO pickle_dealership_credits (credit_key,identifier,amount,currency,state) VALUES (?,?,?,?,'pending')",values={creditKey,row.current_bidder,bid,row.current_payment_method or 'bank'}}
+            queries[#queries+1]={query='UPDATE pickle_dealership_auction_bids SET refunded=1 WHERE auction_id=? AND bidder_identifier=? AND refunded=0',values={row.id,row.current_bidder}}
         end
     end
+    if not MySQL.transaction.await(queries) then return false end
+    if creditKey then DealerCredit(row.current_bidder,bid,row.current_payment_method or 'bank',creditKey) end
+    if won then
+        local dealer=GetDealership(row.dealership_id)
+        if dealer then dealer.balance=tonumber(MySQL.scalar.await('SELECT balance FROM pickle_dealerships WHERE id=?',{row.dealership_id})) or dealer.balance end
+        local ok,err=pcall(AddLedgerEntry,row.dealership_id,'auction_sale',net,'Auction #'..row.id,row.current_bidder)
+        if not ok then print('[pickle_dealerships] Auction ledger reconciliation required: '..tostring(err)) end
+        local winner=GetSourceFromIdentifier(row.current_bidder)
+        if winner then TriggerClientEvent('pickle_dealerships:notify',winner,('You won auction #%d for $%d.'):format(row.id,bid)) end
+    end
+    BroadcastAuctionUpdate(row.id)
+    return true
+end
 
-    BroadcastAuctionUpdate(auctionId)
+local function FinalizeAuction(row)
+    if not DealerReady then return false end
+    return DealerRunMutation(function()
+        local fresh=FetchAuction(row.id)
+        if not fresh or fresh.status~='active' then return end
+        return FinalizeAuctionUnsafe(fresh)
+    end)
 end
 
 CreateThread(function()

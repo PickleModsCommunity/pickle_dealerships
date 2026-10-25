@@ -12,7 +12,7 @@ DealershipCache = {}
 CreateThread(function()
     MySQL.ready(function()
         -- pickle_dealerships
-        MySQL.Async.execute([[
+        MySQL.query.await([[
             CREATE TABLE IF NOT EXISTS `pickle_dealerships` (
                 `id`               INT UNSIGNED    NOT NULL AUTO_INCREMENT,
                 `name`             VARCHAR(100)    NOT NULL,
@@ -37,7 +37,7 @@ CreateThread(function()
         ]])
 
         -- pickle_dealership_employees
-        MySQL.Async.execute([[
+        MySQL.query.await([[
             CREATE TABLE IF NOT EXISTS `pickle_dealership_employees` (
                 `id`              INT UNSIGNED   NOT NULL AUTO_INCREMENT,
                 `dealership_id`   INT UNSIGNED   NOT NULL,
@@ -53,7 +53,7 @@ CreateThread(function()
         ]])
 
         -- pickle_dealership_stock
-        MySQL.Async.execute([[
+        MySQL.query.await([[
             CREATE TABLE IF NOT EXISTS `pickle_dealership_stock` (
                 `id`              INT UNSIGNED   NOT NULL AUTO_INCREMENT,
                 `dealership_id`   INT UNSIGNED   NOT NULL,
@@ -83,7 +83,7 @@ CreateThread(function()
         ]])
 
         -- pickle_dealership_orders — pending/in-transit orders (separate from available stock)
-        MySQL.Async.execute([[
+        MySQL.query.await([[
             CREATE TABLE IF NOT EXISTS `pickle_dealership_orders` (
                 `id`              INT UNSIGNED   NOT NULL AUTO_INCREMENT,
                 `dealership_id`   INT UNSIGNED   NOT NULL,
@@ -108,7 +108,7 @@ CreateThread(function()
         ]])
 
         -- pickle_dealership_ledger
-        MySQL.Async.execute([[
+        MySQL.query.await([[
             CREATE TABLE IF NOT EXISTS `pickle_dealership_ledger` (
                 `id`              INT UNSIGNED   NOT NULL AUTO_INCREMENT,
                 `dealership_id`   INT UNSIGNED   NOT NULL,
@@ -124,7 +124,7 @@ CreateThread(function()
         ]])
 
         -- pickle_dealership_financing
-        MySQL.Async.execute([[
+        MySQL.query.await([[
             CREATE TABLE IF NOT EXISTS `pickle_dealership_financing` (
                 `id`                 INT UNSIGNED   NOT NULL AUTO_INCREMENT,
                 `dealership_id`      INT UNSIGNED   NOT NULL,
@@ -147,7 +147,7 @@ CreateThread(function()
         ]])
 
         -- pickle_dealership_coupons
-        MySQL.Async.execute([[
+        MySQL.query.await([[
             CREATE TABLE IF NOT EXISTS `pickle_dealership_coupons` (
                 `id`                   INT UNSIGNED   NOT NULL AUTO_INCREMENT,
                 `dealership_id`        INT UNSIGNED   NOT NULL,
@@ -171,7 +171,7 @@ CreateThread(function()
         -- Per-player redemption tally. Lets the coupon system enforce a
         -- "first N unique players" rule via `max_uses_per_player`. Composite
         -- PK so an UPSERT atomically increments the row for (coupon, player).
-        MySQL.Async.execute([[
+        MySQL.query.await([[
             CREATE TABLE IF NOT EXISTS `pickle_dealership_coupon_uses` (
                 `coupon_id`   INT UNSIGNED   NOT NULL,
                 `identifier`  VARCHAR(64)    NOT NULL,
@@ -185,13 +185,13 @@ CreateThread(function()
         -- Older installs already have pickle_dealership_coupons without the
         -- per-player column. Default 0 keeps existing rows behaving exactly
         -- like before (no per-player limit).
-        MySQL.Async.execute([[
+        MySQL.query.await([[
             ALTER TABLE `pickle_dealership_coupons`
             ADD COLUMN IF NOT EXISTS `max_uses_per_player` INT UNSIGNED NOT NULL DEFAULT 0
         ]])
 
         -- pickle_dealership_deliveries
-        MySQL.Async.execute([[
+        MySQL.query.await([[
             CREATE TABLE IF NOT EXISTS `pickle_dealership_deliveries` (
                 `id`               INT UNSIGNED   NOT NULL AUTO_INCREMENT,
                 `dealership_id`    INT UNSIGNED   NOT NULL,
@@ -210,7 +210,7 @@ CreateThread(function()
         ]])
 
         -- Gameplay delivery system: in-game configurable pickup depots
-        MySQL.Async.execute([[
+        MySQL.query.await([[
             CREATE TABLE IF NOT EXISTS `pickle_delivery_depots` (
                 `id`             INT UNSIGNED   NOT NULL AUTO_INCREMENT,
                 `name`           VARCHAR(100)   NOT NULL,
@@ -232,7 +232,7 @@ CreateThread(function()
         ]])
 
         -- Gameplay delivery system: per-player driver progression
-        MySQL.Async.execute([[
+        MySQL.query.await([[
             CREATE TABLE IF NOT EXISTS `pickle_dealership_driver_progression` (
                 `identifier`         VARCHAR(64)   NOT NULL,
                 `xp`                 INT           NOT NULL DEFAULT 0,
@@ -247,7 +247,7 @@ CreateThread(function()
         ]])
 
         -- pickle_wholesale_catalog (admin-managed vehicle catalog)
-        MySQL.Async.execute([[
+        MySQL.query.await([[
             CREATE TABLE IF NOT EXISTS `pickle_wholesale_catalog` (
                 `id`              INT UNSIGNED   NOT NULL AUTO_INCREMENT,
                 `model`           VARCHAR(100)   NOT NULL,
@@ -266,7 +266,7 @@ CreateThread(function()
         ]])
 
         -- Auctions
-        MySQL.Async.execute([[
+        MySQL.query.await([[
             CREATE TABLE IF NOT EXISTS `pickle_dealership_auctions` (
                 `id`                  INT AUTO_INCREMENT PRIMARY KEY,
                 `stock_id`            INT NOT NULL,
@@ -293,7 +293,7 @@ CreateThread(function()
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
         ]])
 
-        MySQL.Async.execute([[
+        MySQL.query.await([[
             CREATE TABLE IF NOT EXISTS `pickle_dealership_auction_bids` (
                 `id`                  INT AUTO_INCREMENT PRIMARY KEY,
                 `auction_id`          INT NOT NULL,
@@ -310,11 +310,11 @@ CreateThread(function()
         -- Defensive migrations: older installs already have these tables without
         -- the payment-method columns we now depend on. Both servers we target
         -- (MariaDB and MySQL 8.0.29+) support ADD COLUMN IF NOT EXISTS.
-        MySQL.Async.execute([[
+        MySQL.query.await([[
             ALTER TABLE `pickle_dealership_auctions`
             ADD COLUMN IF NOT EXISTS `current_payment_method` VARCHAR(16) DEFAULT NULL
         ]])
-        MySQL.Async.execute([[
+        MySQL.query.await([[
             ALTER TABLE `pickle_dealership_auction_bids`
             ADD COLUMN IF NOT EXISTS `payment_method` VARCHAR(16) NOT NULL DEFAULT 'bank'
         ]])
@@ -323,7 +323,7 @@ CreateThread(function()
         -- `quantity` column that was added later. DEFAULT 1 gives every
         -- existing row a sane unit count so SUM(ds.quantity) reads correctly
         -- instead of returning NULL and showing 0's in the NUI stock list.
-        MySQL.Async.execute([[
+        MySQL.query.await([[
             ALTER TABLE `pickle_dealership_stock`
             ADD COLUMN IF NOT EXISTS `quantity` INT UNSIGNED NOT NULL DEFAULT 1
         ]])
@@ -334,7 +334,7 @@ CreateThread(function()
         -- when (vehicle.groups ∩ dealership.groups) is non-empty. The legacy
         -- `tier` columns on pickle_wholesale_catalog and pickle_dealerships are
         -- left in place (unread) so older installs can roll back cleanly.
-        MySQL.Async.execute([[
+        MySQL.query.await([[
             CREATE TABLE IF NOT EXISTS `pickle_catalog_groups` (
                 `id`          INT UNSIGNED NOT NULL AUTO_INCREMENT,
                 `name`        VARCHAR(64)  NOT NULL,
@@ -347,7 +347,7 @@ CreateThread(function()
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
         ]])
 
-        MySQL.Async.execute([[
+        MySQL.query.await([[
             CREATE TABLE IF NOT EXISTS `pickle_catalog_vehicle_groups` (
                 `catalog_id` INT UNSIGNED NOT NULL,
                 `group_id`   INT UNSIGNED NOT NULL,
@@ -356,7 +356,7 @@ CreateThread(function()
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
         ]])
 
-        MySQL.Async.execute([[
+        MySQL.query.await([[
             CREATE TABLE IF NOT EXISTS `pickle_dealership_groups` (
                 `dealership_id` INT          NOT NULL,
                 `group_id`      INT UNSIGNED NOT NULL,
@@ -380,7 +380,7 @@ CreateThread(function()
                 for stmt in seedSQL:gmatch("[^;]+") do
                     local trimmed = stmt:gsub("^%s+", ""):gsub("%s+$", "")
                     if trimmed ~= "" then
-                        MySQL.Async.execute(trimmed)
+                        MySQL.query.await(trimmed)
                     end
                 end
             end
@@ -393,6 +393,7 @@ CreateThread(function()
 
         -- Load pickle_dealerships into cache after tables are ready
         LoadDealerships()
+        DealerBaseReady=true
         LoadDeliveryDepots()
     end)
 end)
@@ -429,14 +430,14 @@ function BackfillCatalogGroups()
 
     -- 2. Backfill catalog→group junction from the legacy tier column.
     local vgCount = MySQL.scalar.await("SELECT COUNT(*) FROM `pickle_catalog_vehicle_groups`") or 0
-    if tonumber(vgCount) == 0 then
+    if true then
         local groups = MySQL.query.await("SELECT `id`, `name` FROM `pickle_catalog_groups`") or {}
         local groupIdByName = {}
         for _, g in ipairs(groups) do groupIdByName[g.name] = g.id end
 
-        local catalogRows = MySQL.query.await("SELECT `id`, `tier` FROM `pickle_wholesale_catalog`") or {}
+        local catalogRows = MySQL.query.await("SELECT `id`, `tier` FROM `pickle_wholesale_catalog` c WHERE NOT EXISTS (SELECT 1 FROM pickle_catalog_vehicle_groups vg WHERE vg.catalog_id=c.id)") or {}
         for _, row in ipairs(catalogRows) do
-            local gid = row.tier and groupIdByName[row.tier]
+            local gid = groupIdByName[row.tier or "basic"] or groupIdByName.basic
             if gid then
                 MySQL.insert.await(
                     "INSERT IGNORE INTO `pickle_catalog_vehicle_groups` (`catalog_id`, `group_id`) VALUES (?, ?)",
@@ -790,6 +791,7 @@ function PlayerCanAccessDealership(source, dealership)
 
     local identifier = GetIdentifier and GetIdentifier(source) or nil
     if identifier and dealership.owner_identifier == identifier then return true end
+    if identifier and MySQL.scalar.await("SELECT 1 FROM pickle_dealership_employees WHERE dealership_id=? AND identifier=? LIMIT 1",{dealership.id,identifier}) then return true end
 
     local access = GetDealershipAccess(dealership)
     if access.mode == "public" then return true end
@@ -846,7 +848,7 @@ end
 
 function AddLedgerEntry(dealershipId, type, amount, description, identifier)
     if not dealershipId or not type or not amount then return end
-    MySQL.insert(
+    MySQL.insert.await(
         "INSERT INTO `pickle_dealership_ledger` (`dealership_id`, `type`, `amount`, `description`, `identifier`) VALUES (?, ?, ?, ?, ?)",
         { tonumber(dealershipId), type, tonumber(amount), description or "", identifier }
     )
@@ -889,8 +891,10 @@ local function JobGradeToRole(source, dealership)
     if not dealership.job or dealership.job == "" then return nil end
     if GetPlayerJobName(source) ~= dealership.job then return nil end
     local grade = GetPlayerJobGrade(source) or 0
+    local grades=GetJobGrades(dealership.job) or {}
+    if #grades==0 then return nil end
     local maxGrade = 0
-    for _, g in ipairs(GetJobGrades(dealership.job) or {}) do
+    for _, g in ipairs(grades) do
         if g.level > maxGrade then maxGrade = g.level end
     end
     -- The top grade is always the owner so a job-backed store always has someone
@@ -1141,23 +1145,23 @@ end
 
 _G.PickleStockLocks = _G.PickleStockLocks or {}
 
+local heldStock={}
 function AcquireStockLock(stockId)
-    local id = tonumber(stockId)
-    if not id then return false end
-    if _G.PickleStockLocks[id] then return false end
-    _G.PickleStockLocks[id] = true
-    -- Safety net: if the holder errors before calling ReleaseStockLock the
-    -- lock would otherwise stay set until resource restart, permanently
-    -- blocking that stock row with "Vehicle has already been sold."
-    SetTimeout(30000, function()
-        if _G.PickleStockLocks[id] then _G.PickleStockLocks[id] = nil end
-    end)
+    local id=tonumber(stockId); local owner=coroutine.running()
+    if not id or id%1~=0 or _G.PickleStockLocks[id] then return false end
+    local token={owner=owner}; _G.PickleStockLocks[id]=token
+    heldStock[owner]=heldStock[owner] or {}; heldStock[owner][id]=token
     return true
 end
-
 function ReleaseStockLock(stockId)
-    local id = tonumber(stockId)
-    if id then _G.PickleStockLocks[id] = nil end
+    local id=tonumber(stockId); local owner=coroutine.running()
+    local token=heldStock[owner] and heldStock[owner][id]
+    if token and _G.PickleStockLocks[id]==token then _G.PickleStockLocks[id]=nil; heldStock[owner][id]=nil end
+end
+function ReleaseDealerOperationLocks()
+    local owner=coroutine.running()
+    for id,token in pairs(heldStock[owner] or {}) do if _G.PickleStockLocks[id]==token then _G.PickleStockLocks[id]=nil end end
+    heldStock[owner]=nil
 end
 
 -- oxmysql on this server returns SQL NULL DATETIME columns as the number 0

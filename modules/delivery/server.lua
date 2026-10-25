@@ -682,6 +682,8 @@ lib.callback.register('pickle_dealerships:acceptDelivery', function(source, orde
         dealershipId = primaryOrder.dealership_id,
         dealershipLocation = dealership.location,
         identifier = identifier,
+        started=os.time(),
+        trailerModel=trailerPlan.trailerModel,
         route = route,
         routeId = routeId,
         primaryLabel = primaryOrder.vehicle_label or primaryOrder.vehicle_model,
@@ -724,40 +726,48 @@ end)
 
 -- ─── Completion ──────────────────────────────────────────────────────────────
 
+RegisterNetEvent('pickle_dealerships:bindDeliveryEntities',function(id,truckNet,trailerNet)
+    local src=source; local delivery=activeDeliveries[src]
+    if not delivery or delivery.deliveryId~=id or delivery.truck or delivery.identifier~=GetIdentifier(src) then return end
+    if not DealerInt(truckNet,1,2147483647) or not DealerInt(trailerNet,1,2147483647) then return end
+    local truck=NetworkGetEntityFromNetworkId(truckNet); local trailer=NetworkGetEntityFromNetworkId(trailerNet)
+    local pickup=delivery.route and (delivery.route.spawnCoords or delivery.route.pickupCoords or delivery.route.pickup)
+    if not pickup or truck==0 or trailer==0 or NetworkGetEntityOwner(truck)~=src or NetworkGetEntityOwner(trailer)~=src
+        or GetEntityModel(truck)~=joaat(Config.Trailer.models.truck or 'phantom')
+        or GetEntityModel(trailer)~=joaat(delivery.trailerModel or Config.Trailer.models.enclosed)
+        or #(GetEntityCoords(truck)-vector3(pickup.x,pickup.y,pickup.z))>30 then return end
+    delivery.truck=truck; delivery.trailer=trailer
+    CreateThread(function()
+        local last=GetEntityCoords(truck)
+        while activeDeliveries[src]==delivery and not delivery.completing do
+            Wait(1000)
+            if not DoesEntityExist(truck) or not DoesEntityExist(trailer) then delivery.invalid=true; return end
+            local coords=GetEntityCoords(truck)
+            if #(coords-last)>250 then delivery.invalid=true; return end
+            last=coords
+        end
+    end)
+end)
+
 lib.callback.register('pickle_dealerships:completeDelivery', function(source, deliveryId, vehicleCondition)
     local delivery = activeDeliveries[source]
     if not delivery or delivery.deliveryId ~= deliveryId then
         return false, 'No matching active delivery found.'
     end
 
-    local condition = tonumber(vehicleCondition)
+    if delivery.invalid or not delivery.truck or not delivery.trailer or not DoesEntityExist(delivery.truck) or not DoesEntityExist(delivery.trailer) then return false,'Verified mission rig required' end
+    local ok,body=pcall(GetVehicleBodyHealth,delivery.truck)
+    local condition=ok and math.max(0,math.min(100,body/10)) or 0
     local payout, streakMult, damageMult = ComputeFinalPayout(delivery.fee or 0, delivery.identifier, condition)
 
-    -- Convert each bundled order into stock (stacking identical models when possible).
-    for _, line in ipairs(delivery.orders or {}) do
-        local existing = MySQL.single.await(
-            'SELECT id FROM pickle_dealership_stock WHERE dealership_id = ? AND vehicle_model = ? AND sold_at IS NULL AND display_spot IS NULL AND is_used = 0 AND (`condition` = 100.00 OR `condition` IS NULL) ORDER BY id ASC LIMIT 1',
-            { delivery.dealershipId, line.model }
-        )
-        if existing then
-            MySQL.update.await('UPDATE pickle_dealership_stock SET quantity = quantity + ? WHERE id = ?', { line.quantity, existing.id })
-        else
-            MySQL.insert.await(
-                'INSERT INTO pickle_dealership_stock (dealership_id, vehicle_model, vehicle_label, wholesale_cost, retail_price, ordered_at, delivered_at, quantity) VALUES (?, ?, ?, ?, ?, NOW(), NOW(), ?)',
-                { delivery.dealershipId, line.model, line.label or line.model, line.wholesale, line.retail, line.quantity }
-            )
-        end
-    end
-
-    -- Delete all bundled order rows in one query.
-    if delivery.orderIds and #delivery.orderIds > 0 then
-        local placeholders = {}
-        for _ = 1, #delivery.orderIds do placeholders[#placeholders + 1] = '?' end
-        MySQL.update.await(
-            ("DELETE FROM pickle_dealership_orders WHERE id IN (%s)"):format(table.concat(placeholders, ',')),
-            delivery.orderIds
-        )
-    end
+    if delivery.identifier~=GetIdentifier(source) or delivery.completing or os.time()-(delivery.started or 0)<30 then return false,'Invalid delivery session' end
+    local dealer=GetDealership(delivery.dealershipId)
+    local drop=GetDealershipDropoff(dealer)
+    local ped=GetPlayerPed(source)
+    if not drop or ped==0 or #(GetEntityCoords(ped)-vector3(drop.x,drop.y,drop.z))>20 then return false,'Not at the delivery point' end
+    if #(GetEntityCoords(delivery.trailer)-vector3(drop.x,drop.y,drop.z))>20 or #(GetEntityCoords(delivery.truck)-vector3(drop.x,drop.y,drop.z))>40 then return false,'The verified rig must reach the drop-off' end
+    delivery.completing=true
+    if not DealerCommitOrders(delivery.orderIds,delivery.identifier) then delivery.completing=nil; return false,'Orders already processed or unavailable' end
 
     MySQL.update.await(
         "UPDATE pickle_dealership_deliveries SET status = 'completed', completed_at = NOW() WHERE id = ?",
@@ -921,12 +931,13 @@ CreateThread(function()
               AND ordered_at < DATE_SUB(NOW(), INTERVAL 24 HOUR)
         ]]) or {}
         for _, o in ipairs(stale) do
-            local refund = math.floor((o.wholesale_cost or 0) * (o.quantity or 1) * 0.5)
+            local removed=MySQL.update.await('DELETE FROM pickle_dealership_orders WHERE id=? AND claimed_by IS NULL',{o.id})
+            local refund = removed==1 and math.floor((o.wholesale_cost or 0) * (o.quantity or 1) * 0.5) or 0
             if refund > 0 then
                 MySQL.update.await('UPDATE pickle_dealerships SET balance = balance + ? WHERE id = ?', { refund, o.dealership_id })
                 AddLedgerEntry(o.dealership_id, 'refund', refund, ('Stale local delivery order expired: %s'):format(o.vehicle_model), nil)
             end
-            MySQL.update.await('DELETE FROM pickle_dealership_orders WHERE id = ?', { o.id })
+
         end
         if #stale > 0 then
             TriggerClientEvent('pickle_dealerships:deliveryQueueChanged', -1)

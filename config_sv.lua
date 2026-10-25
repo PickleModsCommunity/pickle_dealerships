@@ -1,6 +1,8 @@
 if not IsDuplicityVersion() then return end
 
 ServerConfig = {}
+-- Explicit server resource allowlist for repossession exports.
+ServerConfig.RepoResources = {}
 
 -- Discord Webhooks
 -- Lives in config_sv.lua (never replicated to clients). Set per-category URLs

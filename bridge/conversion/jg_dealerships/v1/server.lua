@@ -321,7 +321,7 @@ local stockEntity = {
                     local color = safeJsonDecode(r.color)
                     local newId = MySQL.insert.await(
                         "INSERT INTO pickle_dealership_stock (dealership_id, vehicle_model, vehicle_label, wholesale_cost, retail_price, color, display_spot, ordered_at, delivered_at, acquired_from) VALUES (?, ?, ?, ?, ?, ?, ?, NOW(), NOW(), 'jg_import')",
-                        { pickleId, r.vehicle, label, wholesale, retail, color and json.encode(color) or nil, r.coords }
+                        { pickleId, r.vehicle, label, wholesale, retail, color and json.encode(color) or nil, nil }
                     )
                     if newId then res.inserted = res.inserted + 1
                     else res.skipped = res.skipped + 1 end

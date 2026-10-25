@@ -17,7 +17,6 @@ files {
 shared_scripts {
     "@ox_lib/init.lua",
     "config.lua",
-    "config_sv.lua",
     "locales/locale.lua",
     "locales/translations/*.lua",
     "core/shared.lua",
@@ -31,16 +30,19 @@ client_scripts {
 
 server_scripts {
     "@oxmysql/lib/MySQL.lua",
+    "config_sv.lua",
     "bridge/**/**/server.lua",
     "core/server.lua",
+    "core/authority.lua",
     "modules/**/server.lua",
+    "core/reconciliation.lua",
 }
 
+dependencies { 'ox_lib', 'oxmysql', '/onesync' }
 lua54 'yes'
 
 escrow_ignore {
     "config.lua",
-    "config_sv.lua",
     "core/*.*",
     "bridge/**/**/*.*",
     "bridge/**/*.*",

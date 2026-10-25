@@ -232,7 +232,7 @@ function GetOwnedVehicleFromPlate(plate)
     local data = MySQL.Sync.fetchAll("SELECT * FROM player_vehicles WHERE REPLACE(UPPER(plate), ' ', '')=@plate LIMIT 1;", {
         ['@plate'] = normalized,
     })[1]
-    return data and { owner = data.citizenid, model = data.vehicle } or nil
+    return data and { owner = data.citizenid, model = data.vehicle, properties=data.mods } or nil
 end
 
 -- CD Garage adds an `in_garage` column and uses it (not `state`) to decide
@@ -307,16 +307,17 @@ function AddOwnedVehicleWithProps(source, model, plate, properties)
     local player = GetPlayer(source)
     if not player or not plate then return false end
 
-    local cleanPlate = string.upper((tostring(plate):gsub('%s+', '')))
+    local cleanPlate = DealerPlate(plate)
     local props = properties
     if type(props) == "string" then props = json.decode(props) end
     if type(props) ~= "table" then props = {} end
     props.model = joaat(model)
+    props.modelName=model
     props.plate = cleanPlate
     local mods = json.encode(props)
 
     if DetectInGarageColumn() then
-        MySQL.Async.execute(
+        changed=MySQL.update.await(
             'INSERT INTO player_vehicles (license, citizenid, vehicle, hash, mods, plate, garage, state, in_garage) VALUES (@license, @citizenid, @vehicle, @hash, @mods, @plate, @garage, @state, @in_garage)',
             {
                 ['@license']   = player.PlayerData.license,
@@ -331,7 +332,7 @@ function AddOwnedVehicleWithProps(source, model, plate, properties)
             }
         )
     else
-        MySQL.Async.execute(
+        changed=MySQL.update.await(
             'INSERT INTO player_vehicles (license, citizenid, vehicle, hash, mods, plate, garage, state) VALUES (@license, @citizenid, @vehicle, @hash, @mods, @plate, @garage, @state)',
             {
                 ['@license']   = player.PlayerData.license,
@@ -345,16 +346,16 @@ function AddOwnedVehicleWithProps(source, model, plate, properties)
             }
         )
     end
-    return true
+    return changed==1
 end
 
 function RemoveOwnedVehicle(identifier, plate)
     if not identifier or not plate then return false end
-    MySQL.Async.execute('DELETE FROM player_vehicles WHERE plate = @plate AND citizenid = @citizenid', {
+    local changed=MySQL.update.await("DELETE FROM player_vehicles WHERE REPLACE(UPPER(plate), ' ', '')=REPLACE(UPPER(@plate), ' ', '') AND citizenid=@citizenid", {
         ['@plate'] = plate,
         ['@citizenid'] = identifier,
     })
-    return true
+    return changed==1
 end
 
 function UpdateVehiclePlate(source, plate, newPlate)
@@ -494,7 +495,7 @@ end
 function IsPlayerAdmin(source)
     source = tonumber(source)
     for i = 1, #Config.AdminGroups do
-        if exports.qbx_core:HasPermission(source, Config.AdminGroups[i]) or IsPlayerAceAllowed(source, "command") then
+        if exports.qbx_core:HasPermission(source, Config.AdminGroups[i]) then
             return true
         end
     end

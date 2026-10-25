@@ -69,11 +69,11 @@ lib.callback.register("pickle_dealerships:withdrawFunds", function(source, data)
 
     -- Deduct from dealership
     local newBalance = dealership.balance - amount
-    MySQL.update.await("UPDATE pickle_dealerships SET balance = ? WHERE id = ?", { newBalance, dealershipId })
+    if MySQL.update.await("UPDATE pickle_dealerships SET balance=balance-? WHERE id=? AND balance>=?",{amount,dealershipId,amount+minBalance})~=1 then return {success=false,message="Insufficient funds"} end
     UpdateDealershipCache(dealershipId, { balance = newBalance })
 
     -- Add to player bank
-    AddMoney(source, amount, "bank")
+    if AddMoney(source,amount,"bank")~=true then MySQL.update.await("UPDATE pickle_dealerships SET balance=balance+? WHERE id=?",{amount,dealershipId}); return {success=false,message="Player credit failed"} end
 
     local identifier = GetIdentifier(source)
     local playerName = GetPlayerCharacterName(source) or "Unknown"
@@ -118,7 +118,7 @@ lib.callback.register("pickle_dealerships:depositFunds", function(source, data)
         return { success = false, message = "You don't have enough cash." }
     end
 
-    RemoveMoney(source, amount, "money")
+    if RemoveMoney(source,amount,"money")~=true then return {success=false,message="Payment failed"} end
 
     local newBalance = (dealership.balance or 0) + amount
     MySQL.update.await("UPDATE pickle_dealerships SET balance = ? WHERE id = ?", { newBalance, dealershipId })
@@ -161,7 +161,8 @@ lib.callback.register("pickle_dealerships:upgradeTier", function(source, data)
     end
 
     local upgradeCosts = Config.TierUpgradeCosts or { [1] = 50000, [2] = 150000, [3] = 500000 }
-    local cost = upgradeCosts[currentTier]
+    local tier=Config.Tiers and Config.Tiers[currentTier+1]
+    local cost = tier and tier.upgradeCost or upgradeCosts[currentTier]
     if not cost then
         return { success = false, message = "No upgrade cost defined for this tier." }
     end
@@ -245,7 +246,7 @@ lib.callback.register("pickle_dealerships:deleteCoupon", function(source, data)
     if affected and affected > 0 then
         -- Drop the per-player tally too so a future coupon that recycles
         -- this id (rare, but possible) starts with a clean slate.
-        MySQL.update("DELETE FROM `pickle_dealership_coupon_uses` WHERE `coupon_id` = ?", { couponId })
+        MySQL.update.await("DELETE FROM `pickle_dealership_coupon_uses` WHERE `coupon_id` = ?", { couponId })
         return { success = true, message = "Coupon deleted." }
     else
         return { success = false, message = "Coupon not found." }
@@ -374,7 +375,7 @@ lib.callback.register("pickle_dealerships:validateCoupon", function(source, data
     coupon = coupon[1]
 
     -- Check expiry
-    if coupon.expires_at and os.time() > coupon.expires_at then
+    if coupon.expires_at and os.time() > DealerDate(coupon.expires_at) then
         return { valid = false, message = "This coupon has expired." }
     end
 
@@ -428,7 +429,7 @@ lib.callback.register("pickle_dealerships:validateCoupon", function(source, data
     -- Mirror the sales-path clamping so the preview matches what the buyer
     -- will actually be charged.
     local dv = tonumber(coupon.discount_value) or 0
-    if coupon.discount_type == "percent" or coupon.discount_type == "percentage" then
+    if (coupon.discount_type == "percent" or coupon.discount_type == "percentage") or coupon.discount_type == "percentage" then
         local pct = math.max(0, math.min(100, dv))
         discount = math.floor(purchaseAmount * (pct / 100))
     else
@@ -861,7 +862,7 @@ lib.callback.register("pickle_dealerships:getDashboardStats", function(source, d
 
     -- Total revenue from sold stock
     local totalRevenue = MySQL.scalar.await(
-        "SELECT COALESCE(SUM(retail_price), 0) FROM pickle_dealership_stock WHERE dealership_id = ? AND sold_at IS NOT NULL",
+        "SELECT COALESCE(SUM(amount),0) FROM pickle_dealership_ledger WHERE dealership_id=? AND type IN ('sale','npc_sale','auction_sale')",
         { dealershipId }
     ) or 0
 
@@ -886,7 +887,7 @@ lib.callback.register("pickle_dealerships:getDashboardStats", function(source, d
     ) or 0
 
     local revenueThisWeek = MySQL.scalar.await(
-        "SELECT COALESCE(SUM(retail_price), 0) FROM pickle_dealership_stock WHERE dealership_id = ? AND sold_at IS NOT NULL AND sold_at >= DATE_SUB(NOW(), INTERVAL 7 DAY)",
+        "SELECT COALESCE(SUM(amount),0) FROM pickle_dealership_ledger WHERE dealership_id=? AND type IN ('sale','npc_sale','auction_sale') AND created_at>=DATE_SUB(NOW(),INTERVAL 7 DAY)",
         { dealershipId }
     ) or 0
 

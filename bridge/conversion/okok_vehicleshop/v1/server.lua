@@ -43,7 +43,8 @@ local function loadOkokStands()
         Locales = {},
         GetResourceState = function() return 'missing' end,
     }
-    setmetatable(env, { __index = _G })
+    env.math=math; env.string=string; env.table=table; env.pairs=pairs; env.ipairs=ipairs
+    env.type=type; env.tonumber=tonumber; env.tostring=tostring; env.joaat=joaat; env.GetHashKey=joaat
     local fn = load(cfgStr, 'okok_config', 't', env)
     if not fn then
         _okokStandsCache = false
