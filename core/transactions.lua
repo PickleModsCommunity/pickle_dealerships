@@ -100,4 +100,3 @@ function DealerRefreshBalance(dealer)
     local row = MySQL.single.await('SELECT balance,owner_identifier FROM pickle_dealerships WHERE id=?', {dealer.id})
     if row then dealer.balance=tonumber(row.balance) or 0; dealer.owner_identifier=row.owner_identifier end
 end
-
