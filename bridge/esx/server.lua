@@ -107,11 +107,12 @@ function CheckPermission(source, permission)
 end
 
 function AddMoney(source, count, currency)
+    if type(count) ~= 'number' or count < 0 or count % 1 ~= 0 then return false end
     local xPlayer = ESX.GetPlayerFromId(source)
     if not xPlayer then return false end
-    local currency = currency or "money"
-    local before=GetMoney(source,currency)
-    if not DealerInt(count,0,2147483647) then return false end
+    currency = currency or "money"
+    if currency ~= "money" and currency ~= "bank" and currency ~= "dirty" then return false end
+    if count == 0 then return true end
     if (currency == "money") then
         xPlayer.addMoney(count)
     elseif (currency == "dirty") then
@@ -120,15 +121,17 @@ function AddMoney(source, count, currency)
         xPlayer.addAccountMoney("bank", count)
     end
     TriggerClientEvent("pickle_dealerships:updateMoney", source, GetMoney(source, currency))
-    return GetMoney(source,currency)==before + count
+    return true
 end
 
 function RemoveMoney(source, count, currency)
+    if type(count) ~= 'number' or count < 0 or count % 1 ~= 0 then return false end
     local xPlayer = ESX.GetPlayerFromId(source)
     if not xPlayer then return false end
-    local currency = currency or "money"
-    local before=GetMoney(source,currency)
-    if not DealerInt(count,0,2147483647) or before<count then return false end
+    currency = currency or "money"
+    if currency ~= "money" and currency ~= "bank" and currency ~= "dirty" then return false end
+    if GetMoney(source, currency) < count then return false end
+    if count == 0 then return true end
     if (currency == "money") then
         xPlayer.removeMoney(count)
     elseif (currency == "dirty") then
@@ -137,7 +140,7 @@ function RemoveMoney(source, count, currency)
         xPlayer.removeAccountMoney("bank", count)
     end
     TriggerClientEvent("pickle_dealerships:updateMoney", source, GetMoney(source, currency))
-    return GetMoney(source,currency)==before - count
+    return true
 end
 
 function GetMoney(source, currency)

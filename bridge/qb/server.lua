@@ -143,32 +143,37 @@ function CheckPermission(source, permission)
 end
 
 function AddMoney(source, count, currency)
+    if type(count) ~= 'number' or count < 0 or count % 1 ~= 0 then return false end
     local xPlayer = QBCore.Functions.GetPlayer(tonumber(source))
     if not xPlayer then return false end
-    local currency = currency or "money"
+    currency = currency or "money"
+    if currency ~= "money" and currency ~= "bank" and currency ~= "dirty" then return false end
+    if count == 0 then return true end
     if (currency == "money") then
-        xPlayer.Functions.AddMoney('cash', count)
+        return xPlayer.Functions.AddMoney('cash', count) == true
     elseif (currency == "bank") then
-        xPlayer.Functions.AddMoney('bank', count)
+        return xPlayer.Functions.AddMoney('bank', count) == true
     elseif (currency == "dirty") then
         local setting = Config.FrameworkSettings.dirtyMoney
-        Inventory.AddItem(source, setting == "DEFAULT" and 'dirty_money' or setting, count)
+        return Inventory.AddItem(source, setting == "DEFAULT" and 'dirty_money' or setting, count) == true
     end
-    return true
+    return false
 end
 
 function RemoveMoney(source, count, currency)
+    if type(count) ~= 'number' or count < 0 or count % 1 ~= 0 then return false end
     local xPlayer = QBCore.Functions.GetPlayer(tonumber(source))
     if not xPlayer then return false end
-    local currency = currency or "money"
+    currency = currency or "money"
+    if currency ~= "money" and currency ~= "bank" and currency ~= "dirty" then return false end
+    if count == 0 then return true end
     if (currency == "money") then
         return xPlayer.Functions.RemoveMoney('cash', count)
     elseif (currency == "bank") then
         return xPlayer.Functions.RemoveMoney('bank', count)
     elseif (currency == "dirty") then
         local setting = Config.FrameworkSettings.dirtyMoney
-        Inventory.RemoveItem(source, setting == "DEFAULT" and 'dirty_money' or setting, count)
-        return true
+        return Inventory.RemoveItem(source, setting == "DEFAULT" and 'dirty_money' or setting, count) == true
     end
     return false
 end
@@ -557,14 +562,16 @@ CreateThread(function()
 
     Inventory.AddItem = function(source, name, count, metadata) -- Metadata is not required.
         local xPlayer = QBCore.Functions.GetPlayer(tonumber(source))
-        xPlayer.Functions.AddItem(name, count, nil, metadata)
+        local result = xPlayer.Functions.AddItem(name, count, nil, metadata)
         Inventory.UpdateInventory(source)
+        return result
     end
 
     Inventory.RemoveItem = function(source, name, count)
         local xPlayer = QBCore.Functions.GetPlayer(tonumber(source))
-        xPlayer.Functions.RemoveItem(name, count)
+        local result = xPlayer.Functions.RemoveItem(name, count)
         Inventory.UpdateInventory(source)
+        return result
     end
 
     Inventory.AddWeapon = function(source, name, count, metadata) -- Metadata is not required.

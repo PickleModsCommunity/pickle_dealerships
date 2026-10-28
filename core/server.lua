@@ -393,7 +393,14 @@ CreateThread(function()
 
         -- Load pickle_dealerships into cache after tables are ready
         LoadDealerships()
-        DealerBaseReady=true
+        -- Receipts prevent duplicate order settlement and auction payouts.
+        MySQL.query.await([[CREATE TABLE IF NOT EXISTS pickle_dealership_order_receipts (order_id INT PRIMARY KEY,created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)]])
+        MySQL.query.await([[CREATE TABLE IF NOT EXISTS pickle_dealership_credits (
+            id BIGINT AUTO_INCREMENT PRIMARY KEY,credit_key VARCHAR(191) UNIQUE NOT NULL,identifier VARCHAR(100) NOT NULL,
+            amount BIGINT NOT NULL,currency VARCHAR(20) NOT NULL,state VARCHAR(20) NOT NULL DEFAULT 'pending',created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )]])
+        MySQL.query.await([[CREATE TABLE IF NOT EXISTS pickle_dealership_auction_receipts (auction_id INT PRIMARY KEY,created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)]])
+        DealerReady=true
         LoadDeliveryDepots()
     end)
 end)
@@ -1294,3 +1301,32 @@ function ResolvePurchaseAddons(basePrice, addons)
     end
     return true, addonCost, customPlate
 end
+
+function DealerCredit(identifier,amount,currency,key)
+    if not identifier or not DealerInt(tonumber(amount),1,2147483647) then return false end
+    MySQL.insert.await('INSERT IGNORE INTO pickle_dealership_credits (credit_key,identifier,amount,currency,state) VALUES (?,?,?,?,\'pending\')',{key,identifier,amount,currency or 'bank'})
+    local row=MySQL.single.await('SELECT * FROM pickle_dealership_credits WHERE credit_key=?',{key})
+    if not row or row.state=='paid' then return row~=nil end
+    if row.state~='pending' then return false end
+    local src=GetSourceFromIdentifier(identifier)
+    if not src or DealerIdentity(src)~=identifier then return false end
+    if MySQL.update.await('UPDATE pickle_dealership_credits SET state=\'paying\' WHERE credit_key=? AND state=\'pending\'',{key})~=1 then return false end
+    local ok,result=pcall(AddMoney,src,tonumber(row.amount),row.currency)
+    if not ok then print('[pickle_dealerships] Credit '..key..' requires operator reconciliation'); return false end
+    MySQL.update.await('UPDATE pickle_dealership_credits SET state=? WHERE credit_key=?',{result==true and 'paid' or 'pending',key})
+    return result==true
+end
+
+local function payPendingCredits(src)
+    local identity=DealerIdentity(src)
+    if not identity then return end
+    local rows=MySQL.query.await('SELECT * FROM pickle_dealership_credits WHERE identifier=? AND state=\'pending\' ORDER BY id LIMIT 100',{identity}) or {}
+    for _,row in ipairs(rows) do DealerCredit(identity,tonumber(row.amount),row.currency,row.credit_key) end
+end
+
+RegisterNetEvent('pickle_dealerships:initializePlayer', function()
+    local src = source
+    if not DealerReady or not GetIdentifier(src) then return end
+    payPendingCredits(src)
+    TriggerClientEvent('pickle_dealerships:setupInventory', src, {items=Inventory and Inventory.Items or {}})
+end)

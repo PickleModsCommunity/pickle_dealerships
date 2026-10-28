@@ -35,7 +35,6 @@ server_scripts {
     "core/server.lua",
     "core/transactions.lua",
     "modules/**/server.lua",
-    "core/reconciliation.lua",
 }
 
 dependencies { 'ox_lib', 'oxmysql', '/onesync' }

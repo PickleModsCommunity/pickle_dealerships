@@ -183,30 +183,37 @@ function CheckPermission(source, permission)
 end
 
 function AddMoney(source, count, currency)
+    if type(count) ~= 'number' or count < 0 or count % 1 ~= 0 then return false end
     source = tonumber(source)
+    if not source or not GetPlayer(source) then return false end
     currency = currency or "money"
+    if currency ~= "money" and currency ~= "bank" and currency ~= "dirty" then return false end
+    if count == 0 then return true end
     if currency == "money" then
-        exports.qbx_core:AddMoney(source, 'cash', count, 'pickle_dealerships')
+        return exports.qbx_core:AddMoney(source, 'cash', count, 'pickle_dealerships') == true
     elseif currency == "bank" then
-        exports.qbx_core:AddMoney(source, 'bank', count, 'pickle_dealerships')
+        return exports.qbx_core:AddMoney(source, 'bank', count, 'pickle_dealerships') == true
     elseif currency == "dirty" then
         local setting = Config.FrameworkSettings.dirtyMoney
-        Inventory.AddItem(source, setting == "DEFAULT" and 'dirty_money' or setting, count)
+        return Inventory.AddItem(source, setting == "DEFAULT" and 'dirty_money' or setting, count) == true
     end
-    return true
+    return false
 end
 
 function RemoveMoney(source, count, currency)
+    if type(count) ~= 'number' or count < 0 or count % 1 ~= 0 then return false end
     source = tonumber(source)
+    if not source or not GetPlayer(source) then return false end
     currency = currency or "money"
+    if currency ~= "money" and currency ~= "bank" and currency ~= "dirty" then return false end
+    if count == 0 then return true end
     if currency == "money" then
         return exports.qbx_core:RemoveMoney(source, 'cash', count, 'pickle_dealerships')
     elseif currency == "bank" then
         return exports.qbx_core:RemoveMoney(source, 'bank', count, 'pickle_dealerships')
     elseif currency == "dirty" then
         local setting = Config.FrameworkSettings.dirtyMoney
-        Inventory.RemoveItem(source, setting == "DEFAULT" and 'dirty_money' or setting, count)
-        return true
+        return Inventory.RemoveItem(source, setting == "DEFAULT" and 'dirty_money' or setting, count) == true
     end
     return false
 end
@@ -576,13 +583,15 @@ CreateThread(function()
     end
 
     Inventory.AddItem = function(source, name, count, metadata)
-        exports.qbx_core:AddItem(source, name, count, nil, metadata)
+        local result = exports.qbx_core:AddItem(source, name, count, nil, metadata)
         Inventory.UpdateInventory(source)
+        return result
     end
 
     Inventory.RemoveItem = function(source, name, count)
-        exports.qbx_core:RemoveItem(source, name, count)
+        local result = exports.qbx_core:RemoveItem(source, name, count)
         Inventory.UpdateInventory(source)
+        return result
     end
 
     Inventory.AddWeapon = function(source, name, count, metadata)

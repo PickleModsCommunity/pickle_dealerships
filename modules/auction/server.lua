@@ -257,7 +257,7 @@ lib.callback.register("pickle_dealerships:claimAuctionVehicle", function(source,
             MySQL.update.await("UPDATE pickle_dealership_auctions SET claimed_at=NULL WHERE id=?",{auctionId})
             return false,'Vehicle ownership insert failed'
         end
-        DealerGrantedVehicle(source,plate)
+
 
         -- If caller requested garage-only delivery, skip spawn
         local toGarage = data.toGarage == true

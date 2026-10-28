@@ -15,7 +15,24 @@ local function GetStockItem(stockId)
     return row
 end
 
-local function MarkStockSold(id,buyer,seller) return DealerMarkStockSold(id,buyer,seller) end
+local function MarkStockSold(stockId,buyer,seller)
+    local stock=MySQL.single.await('SELECT * FROM pickle_dealership_stock WHERE id=?',{stockId})
+    if not stock or stock.sold_at or stock.auction_id then error('Stock is no longer available') end
+    if tonumber(stock.quantity or 1)>1 then
+        local ok=MySQL.transaction.await({
+            {query='UPDATE pickle_dealership_stock SET quantity=quantity-1 WHERE id=? AND sold_at IS NULL AND quantity>1',values={stockId}},
+            {query=[[
+                INSERT INTO pickle_dealership_stock (dealership_id,vehicle_model,vehicle_label,wholesale_cost,retail_price,quantity,ordered_at,delivered_at,sold_at,sold_to,sold_by,acquired_from)
+                VALUES (?,?,?,?,?,1,NOW(),NOW(),NOW(),?,?,?)
+            ]],values={stock.dealership_id,stock.vehicle_model,stock.vehicle_label,stock.wholesale_cost,stock.retail_price,buyer,seller or buyer,stock.acquired_from or 'finance_sale'}},
+        })
+        if not ok then error('Stock split failed') end
+    else
+        local rows=MySQL.update.await('UPDATE pickle_dealership_stock SET sold_at=NOW(),sold_to=?,sold_by=? WHERE id=? AND sold_at IS NULL AND auction_id IS NULL',{buyer,seller,stockId})
+        if rows~=1 then error('Stock claim failed') end
+    end
+    return true
+end
 
 local function AddDealershipBalance(dealershipId, amount)
     MySQL.update.await(
@@ -326,8 +343,11 @@ lib.callback.register("pickle_dealerships:createFinancing", function(source, dat
             plate = customPlate or GeneratePlate()
             properties = { plate = plate }
         end
-        if AddOwnedVehicleWithProps(source,stockItem.vehicle_model,plate,properties)~=true then error("Vehicle ownership insert rejected") end
-        DealerGrantedVehicle(source,plate)
+        if AddOwnedVehicleWithProps(source,stockItem.vehicle_model,plate,properties)~=true then
+            if GetIdentifier(source) == identifier then AddMoney(source, upfrontTotal, paymentMethod) end
+            return {success=false, message='Vehicle ownership insert rejected.'}
+        end
+
 
 
         -- Sales tax

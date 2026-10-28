@@ -266,6 +266,7 @@ local function ProcessSale(source, dealershipId, stockItem, paymentMethod, coupo
     finalPrice = finalPrice + (addonCost or 0)
 
     local societyEntry = nil
+    local paidCurrency
     local altCurrencyUsed = nil -- populated when paymentMethod begins with "alt:"
     if type(paymentMethod) == "string" and paymentMethod:sub(1, 4) == "alt:" then
         local key = paymentMethod:sub(5)
@@ -339,6 +340,7 @@ local function ProcessSale(source, dealershipId, stockItem, paymentMethod, coupo
 
         -- Deduct money
         if RemoveMoney(source,finalPrice,currency)~=true then return false,"Payment rejected" end
+        paidCurrency = currency
     end
 
     -- Register vehicle with a single, authoritative plate
@@ -396,8 +398,21 @@ local function ProcessSale(source, dealershipId, stockItem, paymentMethod, coupo
             props.color2 = chosen
         end
     end
-    if AddOwnedVehicleWithProps(source,stockItem.vehicle_model,plate,props)~=true then error('Vehicle ownership insert rejected') end
-    DealerGrantedVehicle(source,plate)
+    if AddOwnedVehicleWithProps(source,stockItem.vehicle_model,plate,props)~=true then
+        -- Refund only this confirmed payment when ownership registration rejects it.
+        if societyEntry then
+            AddSocietyMoney(societyEntry.name, finalPrice)
+        elseif GetIdentifier(source) == identifier then
+            if altCurrencyUsed then
+                local def = GetAltCurrency(altCurrencyUsed.key)
+                if def and def.add then def.add(source, altCurrencyUsed.native) end
+            elseif paidCurrency then
+                AddMoney(source, finalPrice, paidCurrency)
+            end
+        end
+        return false, 'Vehicle ownership insert rejected.'
+    end
+
 
 
     -- Mark stock as sold

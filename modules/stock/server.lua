@@ -1,3 +1,38 @@
+function DealerCommitOrders(ids,owner)
+    if type(ids)~='table' or #ids==0 or #ids>1000 then return false end
+    local queries={}; local seen={}
+    for _,id in ipairs(ids) do
+        if not DealerInt(tonumber(id),1,2147483647) or seen[id] then return false end
+        seen[id]=true
+        local row=MySQL.single.await('SELECT * FROM pickle_dealership_orders WHERE id=?',{id})
+        if not row or not DealerInt(tonumber(row.quantity),1,1000) then return false end
+        if owner and row.claimed_by~=owner then return false end
+        if not owner and (row.claimed_by or not row.delivered_at or DealerDate(row.delivered_at)>os.time()) then return false end
+        queries[#queries+1]={query='INSERT INTO pickle_dealership_order_receipts (order_id) VALUES (?)',values={id}}
+        queries[#queries+1]={query=[[
+            INSERT INTO pickle_dealership_stock (dealership_id,vehicle_model,vehicle_label,wholesale_cost,retail_price,ordered_at,delivered_at,quantity)
+            SELECT dealership_id,vehicle_model,vehicle_label,wholesale_cost,retail_price,ordered_at,NOW(),quantity FROM pickle_dealership_orders WHERE id=?
+        ]],values={id}}
+        queries[#queries+1]={query='DELETE FROM pickle_dealership_orders WHERE id=?',values={id}}
+    end
+    return MySQL.transaction.await(queries)==true
+end
+
+function DealerRestoreVehicle(identifier,model,plate,properties)
+    local key='vehicleRestore:'..identifier..':'..plate
+    SetResourceKvp(key,json.encode({model=model,plate=plate,properties=properties}))
+    local existing=GetOwnedVehicleFromPlate(plate)
+    if existing then
+        if existing.owner==identifier then DeleteResourceKvp(key); return true end
+        return false
+    end
+    local src=GetSourceFromIdentifier(identifier)
+    if not src or DealerIdentity(src)~=identifier then return false end
+    local ok,result=pcall(AddOwnedVehicleWithProps,src,model,plate,properties)
+    if ok and result==true then DeleteResourceKvp(key); return true end
+    return false
+end
+
 --- Returns the wholesale catalog filtered by the dealership's assigned groups
 --- and vehicle type (DB-driven). Catalog visibility used to be a one-tier
 --- comparison; it's now a many-to-many group-membership check via the
@@ -1421,3 +1456,18 @@ function ProcessDeliveredOrders(id, operation)
         return DealerCommitOrders(ids)
     end, operation)
 end
+
+RegisterNetEvent('pickle_dealerships:initializePlayer', function()
+    local identifier = GetIdentifier(source)
+    if not identifier then return end
+    DealerRunMutation(function()
+        local iterator = StartFindKvp('vehicleRestore:'..identifier..':')
+        while true do
+            local key = FindKvp(iterator)
+            if not key then break end
+            local ok, data = pcall(json.decode, GetResourceKvpString(key))
+            if ok and type(data) == 'table' then DealerRestoreVehicle(identifier, data.model, data.plate, data.properties) end
+        end
+        EndFindKvp(iterator)
+    end)
+end)
