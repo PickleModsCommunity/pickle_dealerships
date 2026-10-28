@@ -95,7 +95,7 @@ end
 -- Existing ownership adapters are wrapped after framework selection has finished.
 local addOwned=AddOwnedVehicleWithProps
 AddOwnedVehicleWithProps=function(src,model,plate,properties)
-    local ctx=DealerContexts[coroutine.running()]
+    local ctx=DealerContexts[src]
     if ctx and ctx.source==src and ctx.owner~=DealerIdentity(src) then return false end
     return addOwned(src,model,DealerPlate(plate),properties)==true
 end
@@ -109,7 +109,7 @@ AddMoney=function(src,amount,currency)
 end
 local removeMoney=RemoveMoney
 RemoveMoney=function(src,amount,currency)
-    local ctx=DealerContexts[coroutine.running()]
+    local ctx=DealerContexts[src]
     if ctx and ctx.source==src and ctx.owner~=DealerIdentity(src) then return false end
     currency=currency or 'money'
     if not DealerInt(amount,0,2147483647) or GetMoney(src,currency)<amount then return false end
@@ -138,3 +138,11 @@ function DealerModelName(hash)
     end
     return modelNames[hash]
 end
+
+-- The framework emits this after the character is ready.
+RegisterNetEvent('pickle_dealerships:initializePlayer', function()
+    local src = source
+    if not DealerReady or not DealerIdentity(src) then return end
+    DealerRecoverCredits(src)
+    TriggerClientEvent('pickle_dealerships:setupInventory', src, {items=Inventory and Inventory.Items or {}})
+end)

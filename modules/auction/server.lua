@@ -65,122 +65,131 @@ end
 -- ─── Listing ────────────────────────────────────────────────────────────────
 
 lib.callback.register("pickle_dealerships:createAuction", function(source, data)
-    local stockId = tonumber(data and data.stockId)
-    if not stockId then return false, "Invalid stock id." end
+    return DealerTransaction(source, function()
+        if type(data) ~= 'table' then return false, 'Invalid request.' end
+        local stockId = tonumber(data and data.stockId)
+        if not stockId then return false, "Invalid stock id." end
 
-    local stock = MySQL.single.await("SELECT * FROM `pickle_dealership_stock` WHERE `id` = ?", { stockId })
-    if not stock then return false, "Stock not found." end
-    if stock.sold_at then return false, "Stock already sold." end
-    if stock.auction_id then return false, "Already at auction." end
-    if not (stock.is_used == 1 or stock.is_used == true) then return false, "Only pre-owned vehicles can be auctioned." end
+        local stock = MySQL.single.await("SELECT * FROM `pickle_dealership_stock` WHERE `id` = ?", { stockId })
+        if not stock then return false, "Stock not found." end
+        if stock.sold_at then return false, "Stock already sold." end
+        if stock.auction_id then return false, "Already at auction." end
+        if not (stock.is_used == 1 or stock.is_used == true) then return false, "Only pre-owned vehicles can be auctioned." end
 
-    -- Permission: owner / manager / admin on the owning dealership
-    local role = GetPlayerDealershipRole(source, stock.dealership_id)
-    if role ~= 'owner' and role ~= 'manager' and role ~= 'admin' then
-        return false, "You do not have permission."
-    end
+        -- Permission: owner / manager / admin on the owning dealership
+        local role = GetPlayerDealershipRole(source, stock.dealership_id)
+        if role ~= 'owner' and role ~= 'manager' and role ~= 'admin' then
+            return false, "You do not have permission."
+        end
 
-    local startingBid = math.max(1, math.floor(tonumber(data.startingBid) or 0))
-    local minIncrement = math.max(Config.Auction.minIncrementFloor, math.floor(tonumber(data.minIncrement) or Config.Auction.minIncrementFloor))
-    local reserve = data.reservePrice and math.max(0, math.floor(tonumber(data.reservePrice))) or nil
-    local buyout = data.buyoutPrice and math.max(0, math.floor(tonumber(data.buyoutPrice))) or nil
-    if reserve == 0 then reserve = nil end
-    if buyout == 0 then buyout = nil end
-    if buyout and buyout < startingBid then return false, "Buyout must be ≥ starting bid." end
-    if reserve and reserve < startingBid then return false, "Reserve must be ≥ starting bid." end
+        local startingBid = math.max(1, math.floor(tonumber(data.startingBid) or 0))
+        local minIncrement = math.max(Config.Auction.minIncrementFloor, math.floor(tonumber(data.minIncrement) or Config.Auction.minIncrementFloor))
+        local reserve = data.reservePrice and math.max(0, math.floor(tonumber(data.reservePrice))) or nil
+        local buyout = data.buyoutPrice and math.max(0, math.floor(tonumber(data.buyoutPrice))) or nil
+        if reserve == 0 then reserve = nil end
+        if buyout == 0 then buyout = nil end
+        if buyout and buyout < startingBid then return false, "Buyout must be ≥ starting bid." end
+        if reserve and reserve < startingBid then return false, "Reserve must be ≥ starting bid." end
 
-    local duration = tonumber(data.durationMinutes) or Config.Auction.defaultDuration
-    local validDuration = false
-    for _, d in ipairs(Config.Auction.durations) do if d == duration then validDuration = true break end end
-    if not validDuration then return false, "Invalid duration." end
+        local duration = tonumber(data.durationMinutes) or Config.Auction.defaultDuration
+        local validDuration = false
+        for _, d in ipairs(Config.Auction.durations) do if d == duration then validDuration = true break end end
+        if not validDuration then return false, "Invalid duration." end
 
-    -- Timer doesn't start until the first bid is placed; ends_at stays NULL until then.
-    local id = MySQL.insert.await(
-        [[INSERT INTO `pickle_dealership_auctions`
-          (stock_id, dealership_id, seller_identifier, starting_bid, min_increment, reserve_price, buyout_price, duration_minutes, ends_at)
-          VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL)]],
-        { stockId, stock.dealership_id, GetIdentifier(source), startingBid, minIncrement, reserve, buyout, duration }
-    )
-    if not id then return false, "Failed to create auction." end
+        -- Timer doesn't start until the first bid is placed; ends_at stays NULL until then.
+        local id = MySQL.insert.await(
+            [[INSERT INTO `pickle_dealership_auctions`
+              (stock_id, dealership_id, seller_identifier, starting_bid, min_increment, reserve_price, buyout_price, duration_minutes, ends_at)
+              VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL)]],
+            { stockId, stock.dealership_id, GetIdentifier(source), startingBid, minIncrement, reserve, buyout, duration }
+        )
+        if not id then return false, "Failed to create auction." end
 
-    -- Also clear display_spot so the car is physically taken off the lot for
-    -- the duration of the auction; nobody should be able to walk up and buy
-    -- a vehicle that's currently being auctioned.
-    MySQL.update.await(
-        "UPDATE `pickle_dealership_stock` SET `auction_id` = ?, `unlisted` = 0, `display_spot` = NULL WHERE `id` = ?",
-        { id, stockId }
-    )
-    local dealership = GetDealership(stock.dealership_id)
-    if dealership and dealership.location then
-        TriggerClientEvent('pickle_dealerships:refreshDisplay', -1, dealership.location)
-    end
+        -- Also clear display_spot so the car is physically taken off the lot for
+        -- the duration of the auction; nobody should be able to walk up and buy
+        -- a vehicle that's currently being auctioned.
+        MySQL.update.await(
+            "UPDATE `pickle_dealership_stock` SET `auction_id` = ?, `unlisted` = 0, `display_spot` = NULL WHERE `id` = ?",
+            { id, stockId }
+        )
+        local dealership = GetDealership(stock.dealership_id)
+        if dealership and dealership.location then
+            TriggerClientEvent('pickle_dealerships:refreshDisplay', -1, dealership.location)
+        end
 
-    BroadcastAuctionUpdate(id)
-    return true, id
+        BroadcastAuctionUpdate(id)
+        return true, id
+    end, true)
 end)
 
 -- ─── Bidding ────────────────────────────────────────────────────────────────
 
 lib.callback.register('pickle_dealerships:placeBid',function(src,data)
-    local id=tonumber(data and data.auctionId); local amount=tonumber(data and data.amount)
-    if not DealerInt(id,1,2147483647) or not DealerInt(amount,1,2147483647) then return false,'Invalid bid' end
-    local a=FetchAuction(id)
-    if not a or a.status~='active' or a.current_bidder and a.ends_at and DealerDate(a.ends_at)<=os.time() then return false,'Auction has ended' end
-    local current=tonumber(a.current_bid) or 0
-    local floor=a.current_bidder and current+tonumber(a.min_increment or 1) or tonumber(a.starting_bid or 0)
-    if amount<floor then return false,'Bid is below the current minimum' end
-    local buyout=a.buyout_price and tonumber(a.buyout_price)>0 and amount>=tonumber(a.buyout_price)
-    if buyout then amount=tonumber(a.buyout_price) end
-    local currency=data.paymentMethod=='cash' and 'money' or 'bank'
-    local owner=GetIdentifier(src)
-    if RemoveMoney(src,amount,currency)~=true then return false,'Insufficient funds' end
-    local queries={
-        {query='INSERT INTO pickle_dealership_auction_bids (auction_id,bidder_identifier,amount,payment_method) VALUES (?,?,?,?)',values={id,owner,amount,data.paymentMethod=='cash' and 'cash' or 'bank'}},
-        {query=[[
-            UPDATE pickle_dealership_auctions SET
-              ends_at=CASE WHEN ?=1 THEN NOW() WHEN ?=1 THEN DATE_ADD(NOW(),INTERVAL ? MINUTE)
-                 WHEN TIMESTAMPDIFF(SECOND,NOW(),ends_at)<? THEN DATE_ADD(NOW(),INTERVAL ? SECOND) ELSE ends_at END,
-              current_bid=?,current_bidder=?,current_payment_method=? WHERE id=? AND status='active'
-        ]],values={buyout and 1 or 0,a.current_bidder and 0 or 1,tonumber(a.duration_minutes) or Config.Auction.defaultDuration,
-            Config.Auction.antiSnipeSeconds or 0,Config.Auction.antiSnipeSeconds or 0,amount,owner,data.paymentMethod=='cash' and 'cash' or 'bank',id}},
-    }
-    local previous
-    if a.current_bidder and current>0 then
-        previous=MySQL.single.await('SELECT id FROM pickle_dealership_auction_bids WHERE auction_id=? AND bidder_identifier=? AND amount=? ORDER BY id DESC LIMIT 1',{id,a.current_bidder,current})
-        if not previous then AddMoney(src,amount,currency); return false,'Previous escrow receipt is unavailable' end
-        queries[#queries+1]={query="INSERT IGNORE INTO pickle_dealership_credits (credit_key,identifier,amount,currency,state) VALUES (?,?,?,?,'pending')",values={'auction-refund:'..previous.id,a.current_bidder,current,a.current_payment_method=='cash' and 'money' or 'bank'}}
-        queries[#queries+1]={query='UPDATE pickle_dealership_auction_bids SET refunded=1 WHERE id=?',values={previous.id}}
-    end
-    if not MySQL.transaction.await(queries) then AddMoney(src,amount,currency); return false,'Bid could not be committed' end
-    if previous then DealerCredit(a.current_bidder,current,a.current_payment_method=='cash' and 'money' or 'bank','auction-refund:'..previous.id) end
-    BroadcastAuctionUpdate(id)
-    return true,{amount=amount,buyout=buyout,timerStarted=not a.current_bidder}
+    return DealerTransaction(src, function()
+        if type(data) ~= 'table' then return false, 'Invalid request.' end
+        local id=tonumber(data and data.auctionId); local amount=tonumber(data and data.amount)
+        if not DealerInt(id,1,2147483647) or not DealerInt(amount,1,2147483647) then return false,'Invalid bid' end
+        local a=FetchAuction(id)
+        if not a or a.status~='active' or a.current_bidder and a.ends_at and DealerDate(a.ends_at)<=os.time() then return false,'Auction has ended' end
+        local current=tonumber(a.current_bid) or 0
+        local floor=a.current_bidder and current+tonumber(a.min_increment or 1) or tonumber(a.starting_bid or 0)
+        if amount<floor then return false,'Bid is below the current minimum' end
+        local buyout=a.buyout_price and tonumber(a.buyout_price)>0 and amount>=tonumber(a.buyout_price)
+        if buyout then amount=tonumber(a.buyout_price) end
+        local currency=data.paymentMethod=='cash' and 'money' or 'bank'
+        local owner=GetIdentifier(src)
+        if RemoveMoney(src,amount,currency)~=true then return false,'Insufficient funds' end
+        local queries={
+            {query='INSERT INTO pickle_dealership_auction_bids (auction_id,bidder_identifier,amount,payment_method) VALUES (?,?,?,?)',values={id,owner,amount,data.paymentMethod=='cash' and 'cash' or 'bank'}},
+            {query=[[
+                UPDATE pickle_dealership_auctions SET
+                  ends_at=CASE WHEN ?=1 THEN NOW() WHEN ?=1 THEN DATE_ADD(NOW(),INTERVAL ? MINUTE)
+                     WHEN TIMESTAMPDIFF(SECOND,NOW(),ends_at)<? THEN DATE_ADD(NOW(),INTERVAL ? SECOND) ELSE ends_at END,
+                  current_bid=?,current_bidder=?,current_payment_method=? WHERE id=? AND status='active'
+            ]],values={buyout and 1 or 0,a.current_bidder and 0 or 1,tonumber(a.duration_minutes) or Config.Auction.defaultDuration,
+                Config.Auction.antiSnipeSeconds or 0,Config.Auction.antiSnipeSeconds or 0,amount,owner,data.paymentMethod=='cash' and 'cash' or 'bank',id}},
+        }
+        local previous
+        if a.current_bidder and current>0 then
+            previous=MySQL.single.await('SELECT id FROM pickle_dealership_auction_bids WHERE auction_id=? AND bidder_identifier=? AND amount=? ORDER BY id DESC LIMIT 1',{id,a.current_bidder,current})
+            if not previous then AddMoney(src,amount,currency); return false,'Previous escrow receipt is unavailable' end
+            queries[#queries+1]={query="INSERT IGNORE INTO pickle_dealership_credits (credit_key,identifier,amount,currency,state) VALUES (?,?,?,?,'pending')",values={'auction-refund:'..previous.id,a.current_bidder,current,a.current_payment_method=='cash' and 'money' or 'bank'}}
+            queries[#queries+1]={query='UPDATE pickle_dealership_auction_bids SET refunded=1 WHERE id=?',values={previous.id}}
+        end
+        if not MySQL.transaction.await(queries) then AddMoney(src,amount,currency); return false,'Bid could not be committed' end
+        if previous then DealerCredit(a.current_bidder,current,a.current_payment_method=='cash' and 'money' or 'bank','auction-refund:'..previous.id) end
+        BroadcastAuctionUpdate(id)
+        return true,{amount=amount,buyout=buyout,timerStarted=not a.current_bidder}
+    end, true)
 end)
 
 lib.callback.register("pickle_dealerships:cancelAuction", function(source, data)
-    local auctionId = tonumber(data and data.auctionId)
-    if not auctionId then return false, "Invalid auction id." end
+    return DealerTransaction(source, function()
+        if type(data) ~= 'table' then return false, 'Invalid request.' end
+        local auctionId = tonumber(data and data.auctionId)
+        if not auctionId then return false, "Invalid auction id." end
 
-    local auction = FetchAuction(auctionId)
-    if not auction then return false, "Auction not found." end
-    if auction.status ~= 'active' then return false, "Auction is not active." end
+        local auction = FetchAuction(auctionId)
+        if not auction then return false, "Auction not found." end
+        if auction.status ~= 'active' then return false, "Auction is not active." end
 
-    local role = GetPlayerDealershipRole(source, auction.dealership_id)
-    if role ~= 'owner' and role ~= 'manager' and role ~= 'admin' then
-        return false, "You do not have permission."
-    end
+        local role = GetPlayerDealershipRole(source, auction.dealership_id)
+        if role ~= 'owner' and role ~= 'manager' and role ~= 'admin' then
+            return false, "You do not have permission."
+        end
 
-    if auction.current_bid and auction.current_bid > 0 then
-        return false, "Cannot cancel after bids have been placed."
-    end
+        if auction.current_bid and auction.current_bid > 0 then
+            return false, "Cannot cancel after bids have been placed."
+        end
 
-    MySQL.update.await(
-        "UPDATE `pickle_dealership_auctions` SET `status` = 'cancelled', `ended_at` = NOW() WHERE `id` = ?",
-        { auctionId }
-    )
-    UnlockStock(auction.stock_id)
-    BroadcastAuctionUpdate(auctionId)
-    return true
+        MySQL.update.await(
+            "UPDATE `pickle_dealership_auctions` SET `status` = 'cancelled', `ended_at` = NOW() WHERE `id` = ?",
+            { auctionId }
+        )
+        UnlockStock(auction.stock_id)
+        BroadcastAuctionUpdate(auctionId)
+        return true
+    end, true)
 end)
 
 -- ─── Claim ───────────────────────────────────────────────────────────────────
@@ -202,67 +211,70 @@ lib.callback.register("pickle_dealerships:getPendingPickups", function(source)
 end)
 
 lib.callback.register("pickle_dealerships:claimAuctionVehicle", function(source, data)
-    local auctionId = tonumber(data and data.auctionId)
-    if not auctionId then return false, "Invalid auction id." end
+    return DealerTransaction(source, function()
+        if type(data) ~= 'table' then return false, 'Invalid request.' end
+        local auctionId = tonumber(data and data.auctionId)
+        if not auctionId then return false, "Invalid auction id." end
 
-    local identifier = GetIdentifier(source)
-    if not identifier then return false, "Could not identify player." end
+        local identifier = GetIdentifier(source)
+        if not identifier then return false, "Could not identify player." end
 
-    local row = MySQL.single.await(
-        [[SELECT a.*, s.vehicle_model, s.vehicle_label, s.metadata AS stock_metadata, s.plate, s.dealership_id AS dsid,
-                 d.location AS dealership_location
-          FROM `pickle_dealership_auctions` a
-          JOIN `pickle_dealership_stock` s ON s.id = a.stock_id
-          JOIN `pickle_dealerships` d ON d.id = s.dealership_id
-          WHERE a.id = ?]],
-        { auctionId }
-    )
-    if not row then return false, "Auction not found." end
-    if row.status ~= 'won' then return false, "Auction has no winner." end
-    if row.winner_identifier ~= identifier then return false, "You are not the winner." end
-    if row.claimed_at then return false, "Already claimed." end
+        local row = MySQL.single.await(
+            [[SELECT a.*, s.vehicle_model, s.vehicle_label, s.metadata AS stock_metadata, s.plate, s.dealership_id AS dsid,
+                     d.location AS dealership_location
+              FROM `pickle_dealership_auctions` a
+              JOIN `pickle_dealership_stock` s ON s.id = a.stock_id
+              JOIN `pickle_dealerships` d ON d.id = s.dealership_id
+              WHERE a.id = ?]],
+            { auctionId }
+        )
+        if not row then return false, "Auction not found." end
+        if row.status ~= 'won' then return false, "Auction has no winner." end
+        if row.winner_identifier ~= identifier then return false, "You are not the winner." end
+        if row.claimed_at then return false, "Already claimed." end
 
-    if MySQL.update.await("UPDATE pickle_dealership_auctions SET claimed_at=NOW() WHERE id=? AND claimed_at IS NULL AND status='won'",{auctionId})~=1 then return false,"Already claimed" end
-    MySQL.update.await(
-        "UPDATE `pickle_dealership_stock` SET `sold_at` = NOW(), `sold_to` = ?, `sold_by` = ?, `auction_id` = NULL WHERE `id` = ?",
-        { identifier, 'auction', row.stock_id }
-    )
+        if MySQL.update.await("UPDATE pickle_dealership_auctions SET claimed_at=NOW() WHERE id=? AND claimed_at IS NULL AND status='won'",{auctionId})~=1 then return false,"Already claimed" end
+        MySQL.update.await(
+            "UPDATE `pickle_dealership_stock` SET `sold_at` = NOW(), `sold_to` = ?, `sold_by` = ?, `auction_id` = NULL WHERE `id` = ?",
+            { identifier, 'auction', row.stock_id }
+        )
 
-    -- Parse properties for ownership registration
-    local props = row.stock_metadata
-    if props and type(props) == "string" then props = json.decode(props) or {} end
-    if type(props) ~= "table" then props = {} end
+        -- Parse properties for ownership registration
+        local props = row.stock_metadata
+        if props and type(props) == "string" then props = json.decode(props) or {} end
+        if type(props) ~= "table" then props = {} end
 
-    -- Use a single authoritative plate so GetOwnedVehicleFromPlate resolves correctly
-    -- (matches the sales / financing flow). Falls back to generating one if the stock
-    -- row somehow has no plate.
-    local plate = row.plate
-    if not plate or plate == '' then
-        plate = GeneratePlate()
-    end
-    props.plate = plate
+        -- Use a single authoritative plate so GetOwnedVehicleFromPlate resolves correctly
+        -- (matches the sales / financing flow). Falls back to generating one if the stock
+        -- row somehow has no plate.
+        local plate = row.plate
+        if not plate or plate == '' then
+            plate = GeneratePlate()
+        end
+        props.plate = plate
 
-    if AddOwnedVehicleWithProps(source,row.vehicle_model,plate,props)~=true then
-        MySQL.update.await("UPDATE pickle_dealership_auctions SET claimed_at=NULL WHERE id=?",{auctionId})
-        return false,'Vehicle ownership insert failed'
-    end
-    DealerGrantedVehicle(source,plate)
+        if AddOwnedVehicleWithProps(source,row.vehicle_model,plate,props)~=true then
+            MySQL.update.await("UPDATE pickle_dealership_auctions SET claimed_at=NULL WHERE id=?",{auctionId})
+            return false,'Vehicle ownership insert failed'
+        end
+        DealerGrantedVehicle(source,plate)
 
-    -- If caller requested garage-only delivery, skip spawn
-    local toGarage = data.toGarage == true
-    if toGarage then
-        return true, { toGarage = true, label = row.vehicle_label or row.vehicle_model }
-    end
+        -- If caller requested garage-only delivery, skip spawn
+        local toGarage = data.toGarage == true
+        if toGarage then
+            return true, { toGarage = true, label = row.vehicle_label or row.vehicle_model }
+        end
 
-    return true, {
-        stockId = row.stock_id,
-        model = row.vehicle_model,
-        label = row.vehicle_label,
-        plate = plate,
-        properties = props,
-        dealershipId = row.dsid,
-        dealershipLocation = row.dealership_location,
-    }
+        return true, {
+            stockId = row.stock_id,
+            model = row.vehicle_model,
+            label = row.vehicle_label,
+            plate = plate,
+            properties = props,
+            dealershipId = row.dsid,
+            dealershipLocation = row.dealership_location,
+        }
+    end, true)
 end)
 
 -- ─── Read-only lookups ───────────────────────────────────────────────────────

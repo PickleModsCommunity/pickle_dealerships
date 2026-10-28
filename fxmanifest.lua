@@ -33,7 +33,7 @@ server_scripts {
     "config_sv.lua",
     "bridge/**/**/server.lua",
     "core/server.lua",
-    "core/authority.lua",
+    "core/transactions.lua",
     "modules/**/server.lua",
     "core/reconciliation.lua",
 }

@@ -164,81 +164,85 @@ end)
 ---@param source number
 ---@param locationKey string
 lib.callback.register('pickle_dealerships:purchaseDealership', function(source, locationKey)
-    local cached = GetCachedByLocation(locationKey)
-    local resolved = ResolveDealershipConfig(cached)
-    if not resolved then
-        return { success = false, error = _L("invalid_dealership_location") }
-    end
+    return DealerTransaction(source, function()
+        local cached = GetCachedByLocation(locationKey)
+        local resolved = ResolveDealershipConfig(cached)
+        if not resolved then
+            return { success = false, error = _L("invalid_dealership_location") }
+        end
 
-    if resolved.mode ~= 'player-owned' then
-        return { success = false, error = _L("dealership_cannot_be_purchased") }
-    end
+        if resolved.mode ~= 'player-owned' then
+            return { success = false, error = _L("dealership_cannot_be_purchased") }
+        end
 
-    if cached and cached.owner_identifier then
-        return { success = false, error = _L("dealership_already_owned") }
-    end
+        if cached and cached.owner_identifier then
+            return { success = false, error = _L("dealership_already_owned") }
+        end
 
-    local price = resolved.purchasePrice or 0
-    local identifier = GetIdentifier(source)
-    if not identifier then
-        return { success = false, error = _L("unable_to_identify_player") }
-    end
+        local price = resolved.purchasePrice or 0
+        local identifier = GetIdentifier(source)
+        if not identifier then
+            return { success = false, error = _L("unable_to_identify_player") }
+        end
 
-    local money = GetMoney(source, 'bank')
-    if money < price then
-        return { success = false, error = _L("not_enough_money") }
-    end
+        local money = GetMoney(source, 'bank')
+        if money < price then
+            return { success = false, error = _L("not_enough_money") }
+        end
 
-    local success = RemoveMoney(source, price, 'bank')
-    if not success then
-        return { success = false, error = _L("failed_deduct_payment") }
-    end
+        local success = RemoveMoney(source, price, 'bank')
+        if not success then
+            return { success = false, error = _L("failed_deduct_payment") }
+        end
 
-    MySQL.update.await(
-        'UPDATE pickle_dealerships SET owner_identifier = ?, balance = 0 WHERE id = ?',
-        { identifier, cached.id }
-    )
-    cached.owner_identifier = identifier
-    cached.balance = 0
+        MySQL.update.await(
+            'UPDATE pickle_dealerships SET owner_identifier = ?, balance = 0 WHERE id = ?',
+            { identifier, cached.id }
+        )
+        cached.owner_identifier = identifier
+        cached.balance = 0
 
-    ShowNotification(source, _L("dealership_purchased_price", GetCurrencyString(price)))
-    return { success = true }
+        ShowNotification(source, _L("dealership_purchased_price", GetCurrencyString(price)))
+        return { success = true }
+    end)
 end)
 
 --- Owner sells their dealership back
 ---@param source number
 ---@param locationKey string
 lib.callback.register('pickle_dealerships:sellDealership', function(source, locationKey)
-    local cached = GetCachedByLocation(locationKey)
-    local resolved = ResolveDealershipConfig(cached)
-    if not resolved then
-        return { success = false, error = _L("invalid_dealership_location") }
-    end
+    return DealerTransaction(source, function()
+        local cached = GetCachedByLocation(locationKey)
+        local resolved = ResolveDealershipConfig(cached)
+        if not resolved then
+            return { success = false, error = _L("invalid_dealership_location") }
+        end
 
-    if not cached or not cached.owner_identifier then
-        return { success = false, error = _L("dealership_not_owned") }
-    end
+        if not cached or not cached.owner_identifier then
+            return { success = false, error = _L("dealership_not_owned") }
+        end
 
-    local identifier = GetIdentifier(source)
-    if identifier ~= cached.owner_identifier then
-        return { success = false, error = _L("you_do_not_own_dealership") }
-    end
+        local identifier = GetIdentifier(source)
+        if identifier ~= cached.owner_identifier then
+            return { success = false, error = _L("you_do_not_own_dealership") }
+        end
 
-    local sellbackRate = Config.SellbackRate or 0.5
-    local refund = math.floor((resolved.purchasePrice or 0) * sellbackRate)
+        local sellbackRate = Config.SellbackRate or 0.5
+        local refund = math.floor((resolved.purchasePrice or 0) * sellbackRate)
 
-    MySQL.update.await('DELETE FROM pickle_dealership_employees WHERE dealership_id = ?', { cached.id })
-    MySQL.update.await('DELETE FROM pickle_dealership_stock WHERE dealership_id = ? AND sold_at IS NULL', { cached.id })
-    MySQL.update.await('UPDATE pickle_dealerships SET owner_identifier = NULL, balance = 0 WHERE id = ?', { cached.id })
+        MySQL.update.await('DELETE FROM pickle_dealership_employees WHERE dealership_id = ?', { cached.id })
+        MySQL.update.await('DELETE FROM pickle_dealership_stock WHERE dealership_id = ? AND sold_at IS NULL', { cached.id })
+        MySQL.update.await('UPDATE pickle_dealerships SET owner_identifier = NULL, balance = 0 WHERE id = ?', { cached.id })
 
-    cached.owner_identifier = nil
-    cached.balance = 0
+        cached.owner_identifier = nil
+        cached.balance = 0
 
-    AddMoney(source, refund, 'bank')
-    ShowNotification(source, _L("dealership_sold_refund", GetCurrencyString(refund)))
-    TriggerClientEvent('pickle_dealerships:refreshDisplay', -1, locationKey)
+        AddMoney(source, refund, 'bank')
+        ShowNotification(source, _L("dealership_sold_refund", GetCurrencyString(refund)))
+        TriggerClientEvent('pickle_dealerships:refreshDisplay', -1, locationKey)
 
-    return { success = true, refund = refund }
+        return { success = true, refund = refund }
+    end)
 end)
 
 --- Owner renames their dealership

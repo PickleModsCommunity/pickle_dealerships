@@ -42,104 +42,112 @@ end)
 
 --- Withdraw funds from dealership to personal bank
 lib.callback.register("pickle_dealerships:withdrawFunds", function(source, data)
-    local dealershipId = data.dealershipId
-    local amount = tonumber(data.amount)
+    return DealerTransaction(source, function()
+        if type(data) ~= 'table' then return {success=false, message='Invalid request.'} end
+        local dealershipId = data.dealershipId
+        local amount = tonumber(data.amount)
 
-    if not amount or amount <= 0 then
-        return { success = false, message = "Invalid amount." }
-    end
+        if not DealerInt(amount, 1, 2147483647) then
+            return { success = false, message = "Invalid amount." }
+        end
 
-    if not CanPlayerManage(source, dealershipId) then
-        return { success = false, message = "You do not have permission to withdraw funds." }
-    end
+        if not CanPlayerManage(source, dealershipId) then
+            return { success = false, message = "You do not have permission to withdraw funds." }
+        end
 
-    local dealership = GetDealership(dealershipId)
-    if not dealership then
-        return { success = false, message = "Dealership not found." }
-    end
+        local dealership = GetDealership(dealershipId)
+        if not dealership then
+            return { success = false, message = "Dealership not found." }
+        end
+        DealerRefreshBalance(dealership)
 
-    local minBalance = Config.Management and Config.Management.minimumBalance or 0
-    if (dealership.balance - amount) < minBalance then
-        return { success = false, message = "Withdrawal would put the balance below the minimum (" .. GetCurrencyString(minBalance) .. ")." }
-    end
+        local minBalance = Config.Management and Config.Management.minimumBalance or 0
+        if (dealership.balance - amount) < minBalance then
+            return { success = false, message = "Withdrawal would put the balance below the minimum (" .. GetCurrencyString(minBalance) .. ")." }
+        end
 
-    if amount > dealership.balance then
-        return { success = false, message = "Insufficient dealership funds." }
-    end
+        if amount > dealership.balance then
+            return { success = false, message = "Insufficient dealership funds." }
+        end
 
-    -- Deduct from dealership
-    local newBalance = dealership.balance - amount
-    if MySQL.update.await("UPDATE pickle_dealerships SET balance=balance-? WHERE id=? AND balance>=?",{amount,dealershipId,amount+minBalance})~=1 then return {success=false,message="Insufficient funds"} end
-    UpdateDealershipCache(dealershipId, { balance = newBalance })
+        -- Deduct from dealership
+        local newBalance = dealership.balance - amount
+        if MySQL.update.await("UPDATE pickle_dealerships SET balance=balance-? WHERE id=? AND balance>=?",{amount,dealershipId,amount+minBalance})~=1 then return {success=false,message="Insufficient funds"} end
+        UpdateDealershipCache(dealershipId, { balance = newBalance })
 
-    -- Add to player bank
-    if AddMoney(source,amount,"bank")~=true then MySQL.update.await("UPDATE pickle_dealerships SET balance=balance+? WHERE id=?",{amount,dealershipId}); return {success=false,message="Player credit failed"} end
+        -- Add to player bank
+        if AddMoney(source,amount,"bank")~=true then MySQL.update.await("UPDATE pickle_dealerships SET balance=balance+? WHERE id=?",{amount,dealershipId}); return {success=false,message="Player credit failed"} end
 
-    local identifier = GetIdentifier(source)
-    local playerName = GetPlayerCharacterName(source) or "Unknown"
-    AddLedgerEntry(dealershipId, "withdrawal", -amount, "Withdrawal by " .. playerName, identifier)
+        local identifier = GetIdentifier(source)
+        local playerName = GetPlayerCharacterName(source) or "Unknown"
+        AddLedgerEntry(dealershipId, "withdrawal", -amount, "Withdrawal by " .. playerName, identifier)
 
-    local threshold = (ServerConfig and ServerConfig.Webhooks and ServerConfig.Webhooks.largeWithdrawalThreshold) or 100000
-    LogDiscord("finances", {
-        title = amount >= threshold and "Large Withdrawal" or "Withdrawal",
-        actor = source,
-        dealershipId = dealershipId,
-        fields = {
-            { name = "Dealership", value = dealership.name or "?", inline = true },
-            { name = "Amount", value = GetCurrencyString(amount), inline = true },
-            { name = "New Balance", value = GetCurrencyString(newBalance), inline = true },
-        },
-    })
+        local threshold = (ServerConfig and ServerConfig.Webhooks and ServerConfig.Webhooks.largeWithdrawalThreshold) or 100000
+        LogDiscord("finances", {
+            title = amount >= threshold and "Large Withdrawal" or "Withdrawal",
+            actor = source,
+            dealershipId = dealershipId,
+            fields = {
+                { name = "Dealership", value = dealership.name or "?", inline = true },
+                { name = "Amount", value = GetCurrencyString(amount), inline = true },
+                { name = "New Balance", value = GetCurrencyString(newBalance), inline = true },
+            },
+        })
 
-    return { success = true, newBalance = newBalance, message = "Successfully withdrew " .. GetCurrencyString(amount) .. "." }
+        return { success = true, newBalance = newBalance, message = "Successfully withdrew " .. GetCurrencyString(amount) .. "." }
+    end)
 end)
 
 --- Deposit funds into dealership balance
 lib.callback.register("pickle_dealerships:depositFunds", function(source, data)
-    local dealershipId = data.dealershipId
-    local amount = tonumber(data.amount)
+    return DealerTransaction(source, function()
+        if type(data) ~= 'table' then return {success=false, message='Invalid request.'} end
+        local dealershipId = data.dealershipId
+        local amount = tonumber(data.amount)
 
-    if not amount or amount <= 0 then
-        return { success = false, message = "Invalid amount." }
-    end
+        if not DealerInt(amount, 1, 2147483647) then
+            return { success = false, message = "Invalid amount." }
+        end
 
-    if not CanPlayerManage(source, dealershipId) then
-        return { success = false, message = "You do not have permission to deposit funds." }
-    end
+        if not CanPlayerManage(source, dealershipId) then
+            return { success = false, message = "You do not have permission to deposit funds." }
+        end
 
-    local dealership = GetDealership(dealershipId)
-    if not dealership then
-        return { success = false, message = "Dealership not found." }
-    end
+        local dealership = GetDealership(dealershipId)
+        if not dealership then
+            return { success = false, message = "Dealership not found." }
+        end
+        DealerRefreshBalance(dealership)
 
-    -- Check player has enough cash
-    local playerCash = GetMoney(source, "money")
-    if playerCash < amount then
-        return { success = false, message = "You don't have enough cash." }
-    end
+        -- Check player has enough cash
+        local playerCash = GetMoney(source, "money")
+        if playerCash < amount then
+            return { success = false, message = "You don't have enough cash." }
+        end
 
-    if RemoveMoney(source,amount,"money")~=true then return {success=false,message="Payment failed"} end
+        if RemoveMoney(source,amount,"money")~=true then return {success=false,message="Payment failed"} end
 
-    local newBalance = (dealership.balance or 0) + amount
-    MySQL.update.await("UPDATE pickle_dealerships SET balance = ? WHERE id = ?", { newBalance, dealershipId })
-    UpdateDealershipCache(dealershipId, { balance = newBalance })
+        local newBalance = (dealership.balance or 0) + amount
+        MySQL.update.await("UPDATE pickle_dealerships SET balance = ? WHERE id = ?", { newBalance, dealershipId })
+        UpdateDealershipCache(dealershipId, { balance = newBalance })
 
-    local identifier = GetIdentifier(source)
-    local playerName = GetPlayerCharacterName(source) or "Unknown"
-    AddLedgerEntry(dealershipId, "deposit", amount, "Deposit by " .. playerName, identifier)
+        local identifier = GetIdentifier(source)
+        local playerName = GetPlayerCharacterName(source) or "Unknown"
+        AddLedgerEntry(dealershipId, "deposit", amount, "Deposit by " .. playerName, identifier)
 
-    LogDiscord("finances", {
-        title = "Deposit",
-        actor = source,
-        dealershipId = dealershipId,
-        fields = {
-            { name = "Dealership", value = dealership.name or "?", inline = true },
-            { name = "Amount", value = GetCurrencyString(amount), inline = true },
-            { name = "New Balance", value = GetCurrencyString(newBalance), inline = true },
-        },
-    })
+        LogDiscord("finances", {
+            title = "Deposit",
+            actor = source,
+            dealershipId = dealershipId,
+            fields = {
+                { name = "Dealership", value = dealership.name or "?", inline = true },
+                { name = "Amount", value = GetCurrencyString(amount), inline = true },
+                { name = "New Balance", value = GetCurrencyString(newBalance), inline = true },
+            },
+        })
 
-    return { success = true, newBalance = newBalance, message = "Successfully deposited " .. GetCurrencyString(amount) .. "." }
+        return { success = true, newBalance = newBalance, message = "Successfully deposited " .. GetCurrencyString(amount) .. "." }
+    end)
 end)
 
 --- Upgrade dealership tier

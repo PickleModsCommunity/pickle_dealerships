@@ -626,177 +626,179 @@ end
 --- `deliveryMode`: 'expedited' (timed auto-stock) | 'local' (player-delivery queue) | 'instant' (admin only)
 --- Route for local orders is picked at claim time, not at order time.
 lib.callback.register('pickle_dealerships:orderVehicle', function(source, locationKey, model, wholesalePrice, orderQuantity, deliveryMode)
-    -- Verify player role
-    local identifier = GetIdentifier(source)
-    if not identifier then return false, 'Unable to identify player.' end
+    return DealerTransaction(source, function(transaction)
+        -- Verify player role
+        local identifier = GetIdentifier(source)
+        if not identifier then return false, 'Unable to identify player.' end
 
-    local dealership = MySQL.single.await(
-        'SELECT * FROM pickle_dealerships WHERE location = ?',
-        { locationKey }
-    )
-    if not dealership then return false, 'Dealership not found.' end
-
-    -- Owner + managers (by roster OR job grade) may order stock. Resolving via
-    -- the shared gate means job-graded managers aren't locked out the way the
-    -- old roster-only check left them.
-    if not CanPlayerManageOps(source, dealership.id) then
-        return false, 'You do not have permission to order vehicles.'
-    end
-
-    -- Verify the model is in the DB catalog
-    local catalogEntry = MySQL.single.await(
-        'SELECT * FROM pickle_wholesale_catalog WHERE model = ?',
-        { model }
-    )
-
-    if not catalogEntry then
-        return false, 'This vehicle is not available in the catalog.'
-    end
-
-    -- Verify the dealership is allowed to order this vehicle: vehicle must
-    -- share at least one group with the dealership.
-    local hasOverlap = MySQL.scalar.await([[
-        SELECT 1
-        FROM pickle_catalog_vehicle_groups vg
-        JOIN pickle_dealership_groups dg ON dg.group_id = vg.group_id
-        WHERE vg.catalog_id = ? AND dg.dealership_id = ?
-        LIMIT 1
-    ]], { catalogEntry.id, dealership.id })
-    if not hasOverlap then
-        return false, 'Your dealership is not assigned to a group containing this vehicle.'
-    end
-
-    -- Verify wholesale price matches
-    if catalogEntry.wholesale ~= wholesalePrice then
-        return false, 'Price mismatch. Please refresh the catalog.'
-    end
-
-    -- Resolve delivery mode: explicit arg > dealership default > config default
-    local meta = dealership.metadata
-    if type(meta) == "string" then meta = json.decode(meta) or {} end
-    if type(meta) ~= "table" then meta = {} end
-    local resolvedMode = NormalizeDeliveryMode(
-        deliveryMode
-        or (meta and meta.deliveryMode)
-        or (Config.DealershipDefaults and Config.DealershipDefaults.deliveryMode)
-        or 'expedited'
-    )
-
-    -- For local mode, confirm routes exist globally and the queue isn't over cap
-    if resolvedMode == 'local' then
-        if not next(Config.DeliveryRoutes or {}) then
-            return false, 'No delivery routes configured.'
-        end
-        -- Local deliveries require the dealership to have a configured drop-off point so the
-        -- driver has somewhere to unhitch the trailer. Block placement otherwise.
-        local dropMeta = meta or {}
-        if type(dealership.metadata) == 'string' then
-            dropMeta = json.decode(dealership.metadata) or {}
-        elseif type(dealership.metadata) == 'table' then
-            dropMeta = dealership.metadata
-        end
-        if not dropMeta.deliveryPoint then
-            return false, 'This dealership has no delivery point configured. Ask an admin to place one before ordering locally.'
-        end
-        local cfg = Config.Delivery or {}
-        local openOffers = MySQL.scalar.await(
-            "SELECT COUNT(*) FROM pickle_dealership_orders WHERE dealership_id = ? AND delivery_mode = 'local' AND claimed_by IS NULL",
-            { dealership.id }
-        ) or 0
-        if tonumber(openOffers) >= (cfg.maxActiveQueuePerDealership or 10) then
-            return false, 'Too many open local delivery offers. Wait for drivers to complete existing runs.'
-        end
-    end
-
-    -- Finalize any delivered orders first so stock counts stay consistent even
-    -- though we no longer gate on capacity here.
-    ProcessDeliveredOrders(dealership.id)
-
-    local qty = math.max(1, math.min(100, tonumber(orderQuantity) or 1))
-
-    -- Shared cost resolver (one source of truth for UI previews and order writes)
-    local retailPrice = math.floor(wholesalePrice * 1.3)
-    local costs = ResolveOwnerOrderCost(resolvedMode, wholesalePrice, retailPrice, qty)
-    local totalCost = costs.totalCost
-
-    if dealership.balance < totalCost then
-        return false, 'Insufficient dealership funds. Need $' .. totalCost .. ', have $' .. dealership.balance .. '.'
-    end
-
-    MySQL.update.await('UPDATE pickle_dealerships SET balance = balance - ? WHERE id = ?', { totalCost, dealership.id })
-
-    local stockId
-    if resolvedMode == 'instant' then
-        -- Admin/testing: stack directly into stock
-        local existing = MySQL.single.await(
-            'SELECT id FROM pickle_dealership_stock WHERE dealership_id = ? AND vehicle_model = ? AND sold_at IS NULL AND display_spot IS NULL AND is_used = 0 AND (`condition` = 100.00 OR `condition` IS NULL) ORDER BY id ASC LIMIT 1',
-            { dealership.id, model }
+        local dealership = MySQL.single.await(
+            'SELECT * FROM pickle_dealerships WHERE location = ?',
+            { locationKey }
         )
-        if existing then
-            MySQL.update.await('UPDATE pickle_dealership_stock SET quantity = quantity + ? WHERE id = ?', { qty, existing.id })
-            stockId = existing.id
+        if not dealership then return false, 'Dealership not found.' end
+
+        -- Owner + managers (by roster OR job grade) may order stock. Resolving via
+        -- the shared gate means job-graded managers aren't locked out the way the
+        -- old roster-only check left them.
+        if not CanPlayerManageOps(source, dealership.id) then
+            return false, 'You do not have permission to order vehicles.'
+        end
+
+        -- Verify the model is in the DB catalog
+        local catalogEntry = MySQL.single.await(
+            'SELECT * FROM pickle_wholesale_catalog WHERE model = ?',
+            { model }
+        )
+
+        if not catalogEntry then
+            return false, 'This vehicle is not available in the catalog.'
+        end
+
+        -- Verify the dealership is allowed to order this vehicle: vehicle must
+        -- share at least one group with the dealership.
+        local hasOverlap = MySQL.scalar.await([[
+            SELECT 1
+            FROM pickle_catalog_vehicle_groups vg
+            JOIN pickle_dealership_groups dg ON dg.group_id = vg.group_id
+            WHERE vg.catalog_id = ? AND dg.dealership_id = ?
+            LIMIT 1
+        ]], { catalogEntry.id, dealership.id })
+        if not hasOverlap then
+            return false, 'Your dealership is not assigned to a group containing this vehicle.'
+        end
+
+        -- Verify wholesale price matches
+        if catalogEntry.wholesale ~= wholesalePrice then
+            return false, 'Price mismatch. Please refresh the catalog.'
+        end
+
+        -- Resolve delivery mode: explicit arg > dealership default > config default
+        local meta = dealership.metadata
+        if type(meta) == "string" then meta = json.decode(meta) or {} end
+        if type(meta) ~= "table" then meta = {} end
+        local resolvedMode = NormalizeDeliveryMode(
+            deliveryMode
+            or (meta and meta.deliveryMode)
+            or (Config.DealershipDefaults and Config.DealershipDefaults.deliveryMode)
+            or 'expedited'
+        )
+
+        -- For local mode, confirm routes exist globally and the queue isn't over cap
+        if resolvedMode == 'local' then
+            if not next(Config.DeliveryRoutes or {}) then
+                return false, 'No delivery routes configured.'
+            end
+            -- Local deliveries require the dealership to have a configured drop-off point so the
+            -- driver has somewhere to unhitch the trailer. Block placement otherwise.
+            local dropMeta = meta or {}
+            if type(dealership.metadata) == 'string' then
+                dropMeta = json.decode(dealership.metadata) or {}
+            elseif type(dealership.metadata) == 'table' then
+                dropMeta = dealership.metadata
+            end
+            if not dropMeta.deliveryPoint then
+                return false, 'This dealership has no delivery point configured. Ask an admin to place one before ordering locally.'
+            end
+            local cfg = Config.Delivery or {}
+            local openOffers = MySQL.scalar.await(
+                "SELECT COUNT(*) FROM pickle_dealership_orders WHERE dealership_id = ? AND delivery_mode = 'local' AND claimed_by IS NULL",
+                { dealership.id }
+            ) or 0
+            if tonumber(openOffers) >= (cfg.maxActiveQueuePerDealership or 10) then
+                return false, 'Too many open local delivery offers. Wait for drivers to complete existing runs.'
+            end
+        end
+
+        -- Finalize any delivered orders first so stock counts stay consistent even
+        -- though we no longer gate on capacity here.
+        ProcessDeliveredOrders(dealership.id, transaction)
+
+        local qty = math.max(1, math.min(100, tonumber(orderQuantity) or 1))
+
+        -- Shared cost resolver (one source of truth for UI previews and order writes)
+        local retailPrice = math.floor(wholesalePrice * 1.3)
+        local costs = ResolveOwnerOrderCost(resolvedMode, wholesalePrice, retailPrice, qty)
+        local totalCost = costs.totalCost
+
+        if dealership.balance < totalCost then
+            return false, 'Insufficient dealership funds. Need $' .. totalCost .. ', have $' .. dealership.balance .. '.'
+        end
+
+        MySQL.update.await('UPDATE pickle_dealerships SET balance = balance - ? WHERE id = ?', { totalCost, dealership.id })
+
+        local stockId
+        if resolvedMode == 'instant' then
+            -- Admin/testing: stack directly into stock
+            local existing = MySQL.single.await(
+                'SELECT id FROM pickle_dealership_stock WHERE dealership_id = ? AND vehicle_model = ? AND sold_at IS NULL AND display_spot IS NULL AND is_used = 0 AND (`condition` = 100.00 OR `condition` IS NULL) ORDER BY id ASC LIMIT 1',
+                { dealership.id, model }
+            )
+            if existing then
+                MySQL.update.await('UPDATE pickle_dealership_stock SET quantity = quantity + ? WHERE id = ?', { qty, existing.id })
+                stockId = existing.id
+            else
+                stockId = MySQL.insert.await(
+                    'INSERT INTO pickle_dealership_stock (dealership_id, vehicle_model, vehicle_label, wholesale_cost, retail_price, ordered_at, delivered_at, quantity) VALUES (?, ?, ?, ?, ?, NOW(), NOW(), ?)',
+                    { dealership.id, model, catalogEntry.label or model, wholesalePrice, retailPrice, qty }
+                )
+            end
+        elseif resolvedMode == 'expedited' then
+            -- Auto-resolves on a timer. Stack into an existing open order or create new.
+            local deliveryMinutes = (Config.DeliveryTime or 20) * qty
+            local deliveredAt = os.date('%Y-%m-%d %H:%M:%S', os.time() + (deliveryMinutes * 60))
+            local existingOrder = MySQL.single.await(
+                "SELECT id FROM pickle_dealership_orders WHERE dealership_id = ? AND vehicle_model = ? AND delivery_mode = 'expedited' AND (delivered_at IS NULL OR delivered_at > NOW()) ORDER BY id ASC LIMIT 1",
+                { dealership.id, model }
+            )
+            if existingOrder then
+                MySQL.update.await(
+                    'UPDATE pickle_dealership_orders SET quantity = quantity + ?, delivered_at = GREATEST(COALESCE(delivered_at, ?), ?) WHERE id = ?',
+                    { qty, deliveredAt, deliveredAt, existingOrder.id }
+                )
+                stockId = existingOrder.id
+            else
+                stockId = MySQL.insert.await(
+                    "INSERT INTO pickle_dealership_orders (dealership_id, vehicle_model, vehicle_label, wholesale_cost, retail_price, quantity, delivery_mode, ordered_at, delivered_at) VALUES (?, ?, ?, ?, ?, ?, 'expedited', NOW(), ?)",
+                    { dealership.id, model, catalogEntry.label or model, wholesalePrice, retailPrice, qty, deliveredAt }
+                )
+            end
         else
+            -- Local delivery: order sits in queue for any player to claim. Route is picked at claim time.
             stockId = MySQL.insert.await(
-                'INSERT INTO pickle_dealership_stock (dealership_id, vehicle_model, vehicle_label, wholesale_cost, retail_price, ordered_at, delivered_at, quantity) VALUES (?, ?, ?, ?, ?, NOW(), NOW(), ?)',
-                { dealership.id, model, catalogEntry.label or model, wholesalePrice, retailPrice, qty }
+                "INSERT INTO pickle_dealership_orders (dealership_id, vehicle_model, vehicle_label, wholesale_cost, retail_price, quantity, delivery_mode, delivery_fee, ordered_at, delivered_at) VALUES (?, ?, ?, ?, ?, ?, 'local', ?, NOW(), NULL)",
+                { dealership.id, model, catalogEntry.label or model, wholesalePrice, retailPrice, qty, costs.deliveryFee }
             )
         end
-    elseif resolvedMode == 'expedited' then
-        -- Auto-resolves on a timer. Stack into an existing open order or create new.
-        local deliveryMinutes = (Config.DeliveryTime or 20) * qty
-        local deliveredAt = os.date('%Y-%m-%d %H:%M:%S', os.time() + (deliveryMinutes * 60))
-        local existingOrder = MySQL.single.await(
-            "SELECT id FROM pickle_dealership_orders WHERE dealership_id = ? AND vehicle_model = ? AND delivery_mode = 'expedited' AND (delivered_at IS NULL OR delivered_at > NOW()) ORDER BY id ASC LIMIT 1",
-            { dealership.id, model }
-        )
-        if existingOrder then
-            MySQL.update.await(
-                'UPDATE pickle_dealership_orders SET quantity = quantity + ?, delivered_at = GREATEST(COALESCE(delivered_at, ?), ?) WHERE id = ?',
-                { qty, deliveredAt, deliveredAt, existingOrder.id }
-            )
-            stockId = existingOrder.id
-        else
-            stockId = MySQL.insert.await(
-                "INSERT INTO pickle_dealership_orders (dealership_id, vehicle_model, vehicle_label, wholesale_cost, retail_price, quantity, delivery_mode, ordered_at, delivered_at) VALUES (?, ?, ?, ?, ?, ?, 'expedited', NOW(), ?)",
-                { dealership.id, model, catalogEntry.label or model, wholesalePrice, retailPrice, qty, deliveredAt }
+
+        -- Ledger entry only for paid orders — local mode is free to the dealership.
+        if totalCost > 0 then
+            local desc = ('Vehicle order (%s): %s x%d'):format(resolvedMode, model, qty)
+            MySQL.insert.await(
+                'INSERT INTO pickle_dealership_ledger (dealership_id, type, amount, description, identifier, created_at) VALUES (?, ?, ?, ?, ?, NOW())',
+                { dealership.id, 'expense', -totalCost, desc, identifier }
             )
         end
-    else
-        -- Local delivery: order sits in queue for any player to claim. Route is picked at claim time.
-        stockId = MySQL.insert.await(
-            "INSERT INTO pickle_dealership_orders (dealership_id, vehicle_model, vehicle_label, wholesale_cost, retail_price, quantity, delivery_mode, delivery_fee, ordered_at, delivered_at) VALUES (?, ?, ?, ?, ?, ?, 'local', ?, NOW(), NULL)",
-            { dealership.id, model, catalogEntry.label or model, wholesalePrice, retailPrice, qty, costs.deliveryFee }
-        )
-    end
 
-    -- Ledger entry only for paid orders — local mode is free to the dealership.
-    if totalCost > 0 then
-        local desc = ('Vehicle order (%s): %s x%d'):format(resolvedMode, model, qty)
-        MySQL.insert.await(
-            'INSERT INTO pickle_dealership_ledger (dealership_id, type, amount, description, identifier, created_at) VALUES (?, ?, ?, ?, ?, NOW())',
-            { dealership.id, 'expense', -totalCost, desc, identifier }
-        )
-    end
+        -- Success toast is delivered by the NUI wrapper; avoid double-notifying.
+        TriggerClientEvent('pickle_dealerships:refreshDisplay', -1, locationKey)
+        TriggerClientEvent('pickle_dealerships:deliveryQueueChanged', -1)
 
-    -- Success toast is delivered by the NUI wrapper; avoid double-notifying.
-    TriggerClientEvent('pickle_dealerships:refreshDisplay', -1, locationKey)
-    TriggerClientEvent('pickle_dealerships:deliveryQueueChanged', -1)
+        LogDiscord("stock", {
+            title = "Stock Order Placed",
+            actor = source,
+            dealershipId = dealership.id,
+            fields = {
+                { name = "Dealership", value = dealership.name or "?", inline = true },
+                { name = "Vehicle", value = (catalogEntry.label or model) .. " (`" .. tostring(model) .. "`)", inline = true },
+                { name = "Qty", value = tostring(qty), inline = true },
+                { name = "Mode", value = tostring(resolvedMode), inline = true },
+                { name = "Wholesale", value = GetCurrencyString(wholesalePrice), inline = true },
+                { name = "Total Cost", value = GetCurrencyString(totalCost), inline = true },
+            },
+        })
 
-    LogDiscord("stock", {
-        title = "Stock Order Placed",
-        actor = source,
-        dealershipId = dealership.id,
-        fields = {
-            { name = "Dealership", value = dealership.name or "?", inline = true },
-            { name = "Vehicle", value = (catalogEntry.label or model) .. " (`" .. tostring(model) .. "`)", inline = true },
-            { name = "Qty", value = tostring(qty), inline = true },
-            { name = "Mode", value = tostring(resolvedMode), inline = true },
-            { name = "Wholesale", value = GetCurrencyString(wholesalePrice), inline = true },
-            { name = "Total Cost", value = GetCurrencyString(totalCost), inline = true },
-        },
-    })
-
-    return true, stockId
+        return true, stockId
+    end, true)
 end)
 
 --- UI cost-preview callback used by the stock ordering dialog.
@@ -1155,135 +1157,137 @@ end)
 
 --- Manager trades in a player vehicle as pre-owned stock
 lib.callback.register('pickle_dealerships:tradeInVehicle', function(source, locationKey, payload)
-    local identifier = GetIdentifier(source)
-    if not identifier then return false, 'Unable to identify player.' end
-    if type(payload) ~= 'table' then return false, 'Invalid payload.' end
+    return DealerTransaction(source, function(transaction)
+        local identifier = GetIdentifier(source)
+        if not identifier then return false, 'Unable to identify player.' end
+        if type(payload) ~= 'table' then return false, 'Invalid payload.' end
 
-    local plate = payload.plate and string.upper(tostring(payload.plate):gsub('^%s*(.-)%s*$', '%1')) or nil
-    local properties = payload.properties
-    local buyPrice = math.max(0, math.floor(tonumber(payload.buyPrice) or 0))
-    local retailPrice = math.max(0, math.floor(tonumber(payload.retailPrice) or 0))
+        local plate = payload.plate and string.upper(tostring(payload.plate):gsub('^%s*(.-)%s*$', '%1')) or nil
+        local properties = payload.properties
+        local buyPrice = math.max(0, math.floor(tonumber(payload.buyPrice) or 0))
+        local retailPrice = math.max(0, math.floor(tonumber(payload.retailPrice) or 0))
 
-    if not plate or not properties then return false, 'Missing vehicle data.' end
-    if buyPrice <= 0 or retailPrice <= 0 then return false, 'Buy and retail prices must be set.' end
+        if not plate or not properties then return false, 'Missing vehicle data.' end
+        if buyPrice <= 0 or retailPrice <= 0 then return false, 'Buy and retail prices must be set.' end
 
-    local dealership = MySQL.single.await('SELECT * FROM pickle_dealerships WHERE location = ?', { locationKey })
-    if not dealership then return false, 'Dealership not found.' end
-    if not CanPlayerManageOps(source, dealership.id) then return false, 'You do not have permission.' end
+        local dealership = MySQL.single.await('SELECT * FROM pickle_dealerships WHERE location = ?', { locationKey })
+        if not dealership then return false, 'Dealership not found.' end
+        if not CanPlayerManageOps(source, dealership.id) then return false, 'You do not have permission.' end
 
-    -- Look up owner + model of the plate from the framework record (server-trusted)
-    local owned = GetOwnedVehicleFromPlate(plate)
-    if not owned or not owned.owner then return false, 'This vehicle is not registered to anyone.' end
-    local sellerIdentifier = owned.owner
-    local model = owned.model
-    -- Fall back to the client-supplied model name (resolved from the entity hash)
-    -- when the framework bridge didn't persist a model string in the DB record.
-    -- This mirrors the identical fallback in seizeVehicle (lines ~1292-1296).
-    if (not model or model == '') and payload.modelName and payload.modelName ~= '' then
-        model = tostring(payload.modelName):lower()
-    end
-    if not model then return false, 'Could not resolve vehicle model.' end
-
-    -- Require consent from the online owner before taking their vehicle
-    local sellerSource = GetSourceFromIdentifier(sellerIdentifier)
-    if not sellerSource then
-        return false, 'The vehicle owner is not online.'
-    end
-
-    local catalogLookup = MySQL.single.await('SELECT label FROM pickle_wholesale_catalog WHERE model = ?', { model })
-    local displayLabel = (catalogLookup and catalogLookup.label) or model
-
-    local consented = lib.callback.await('pickle_dealerships:confirmTradeIn', sellerSource, {
-        dealershipName = dealership.name,
-        label = displayLabel,
-        plate = plate,
-        buyPrice = buyPrice,
-    })
-    if not consented then
-        return false, 'The owner declined the trade-in.'
-    end
-
-    -- Re-verify ownership after consent in case something changed during the prompt
-    local recheck = GetOwnedVehicleFromPlate(plate)
-    if not recheck or recheck.owner ~= sellerIdentifier then
-        return false, 'Ownership changed before the trade-in completed.'
-    end
-
-    -- Block trade-in if vehicle is under active financing
-    local activeFinancing = MySQL.scalar.await(
-        "SELECT COUNT(*) FROM `pickle_dealership_financing` WHERE `vehicle_plate` = ? AND `status` = 'active'",
-        { plate }
-    )
-    if activeFinancing and tonumber(activeFinancing) > 0 then
-        return false, 'This vehicle is under active financing and cannot be traded in.'
-    end
-
-    -- Reconcile any delivered orders before balance checks.
-    ProcessDeliveredOrders(dealership.id)
-
-    -- Balance check
-    if dealership.balance < buyPrice then
-        return false, 'Insufficient dealership funds.'
-    end
-
-    -- Derive condition from health (0-1000 in props.bodyHealth/engineHealth → percent)
-    local props = properties
-    if type(props) == 'string' then props = json.decode(props) or {} end
-    local body = tonumber(props.bodyHealth) or 1000
-    local engine = tonumber(props.engineHealth) or 1000
-    local condition = math.max(0, math.min(100, ((body + engine) / 2) / 10))
-
-    local catalog = MySQL.single.await('SELECT label FROM pickle_wholesale_catalog WHERE model = ?', { model })
-    local label = (catalog and catalog.label) or model
-
-    if GetIdentifier(sellerSource)~=sellerIdentifier then return false,'Seller session changed.' end
-    local currentOwner=GetOwnedVehicleFromPlate(plate)
-    if not currentOwner or currentOwner.owner~=sellerIdentifier then return false,'Ownership changed.' end
-    if RemoveOwnedVehicle(sellerIdentifier,plate)~=true then return false,'Ownership removal failed.' end
-    if MySQL.update.await('UPDATE pickle_dealerships SET balance=balance-? WHERE id=? AND balance>=?',{buyPrice,dealership.id,buyPrice})~=1 then
-        DealerRestoreVehicle(sellerIdentifier,model,plate,props)
-        return false,'Insufficient dealership funds.'
-    end
-
-    -- Pay the seller (consent already confirmed above)
-    -- Seller payment is queued only after stock insertion succeeds.
-    ShowNotification(sellerSource, _L('stock_trade_in_seller', label, GetCurrencyString(buyPrice)))
-
-    -- Remove ownership from the seller's framework records
-    -- Ownership was claimed before the dealership debit.
-
-    -- Insert pre-owned stock row (captured vehicle properties stored in metadata)
-    local inserted,stockId=pcall(MySQL.insert.await,
-        'INSERT INTO pickle_dealership_stock (dealership_id, vehicle_model, vehicle_label, wholesale_cost, retail_price, ordered_at, delivered_at, quantity, is_used, metadata, plate, acquired_from, `condition`) VALUES (?, ?, ?, ?, ?, NOW(), NOW(), 1, 1, ?, ?, ?, ?)',
-        {
-            dealership.id, model, label, buyPrice, retailPrice,
-            json.encode(props), plate, sellerIdentifier, condition,
-        }
-    )
-
-    if not inserted or not stockId then
-        DealerRestoreVehicle(sellerIdentifier,model,plate,props)
-        MySQL.update.await('UPDATE pickle_dealerships SET balance=balance+? WHERE id=?',{buyPrice,dealership.id})
-        return false,'Trade-in stock insertion failed; ownership recovery queued.'
-    end
-    DealerCredit(sellerIdentifier,buyPrice,'bank' ,'trade-in:'..tostring(stockId))
-    AddLedgerEntry(dealership.id, 'expense', -buyPrice, 'Trade-in: ' .. label .. ' (' .. plate .. ')', identifier)
-
-    ShowNotification(source, _L('stock_trade_in_buyer', label, GetCurrencyString(buyPrice)))
-    TriggerClientEvent('pickle_dealerships:refreshDisplay', -1, locationKey)
-
-    -- Authoritative server-side delete. Client-side DeleteEntity silently
-    -- fails when the manager running the trade-in doesn't own the vehicle's
-    -- network entity; deleting from the server handles it regardless of owner.
-    local netId = tonumber(payload.netId)
-    if netId then
-        local ent = NetworkGetEntityFromNetworkId(netId)
-        if ent and ent ~= 0 and DoesEntityExist(ent) then
-            DeleteEntity(ent)
+        -- Look up owner + model of the plate from the framework record (server-trusted)
+        local owned = GetOwnedVehicleFromPlate(plate)
+        if not owned or not owned.owner then return false, 'This vehicle is not registered to anyone.' end
+        local sellerIdentifier = owned.owner
+        local model = owned.model
+        -- Fall back to the client-supplied model name (resolved from the entity hash)
+        -- when the framework bridge didn't persist a model string in the DB record.
+        -- This mirrors the identical fallback in seizeVehicle (lines ~1292-1296).
+        if (not model or model == '') and payload.modelName and payload.modelName ~= '' then
+            model = tostring(payload.modelName):lower()
         end
-    end
+        if not model then return false, 'Could not resolve vehicle model.' end
 
-    return true, stockId
+        -- Require consent from the online owner before taking their vehicle
+        local sellerSource = GetSourceFromIdentifier(sellerIdentifier)
+        if not sellerSource then
+            return false, 'The vehicle owner is not online.'
+        end
+
+        local catalogLookup = MySQL.single.await('SELECT label FROM pickle_wholesale_catalog WHERE model = ?', { model })
+        local displayLabel = (catalogLookup and catalogLookup.label) or model
+
+        local consented = lib.callback.await('pickle_dealerships:confirmTradeIn', sellerSource, {
+            dealershipName = dealership.name,
+            label = displayLabel,
+            plate = plate,
+            buyPrice = buyPrice,
+        })
+        if not consented then
+            return false, 'The owner declined the trade-in.'
+        end
+
+        -- Re-verify ownership after consent in case something changed during the prompt
+        local recheck = GetOwnedVehicleFromPlate(plate)
+        if not recheck or recheck.owner ~= sellerIdentifier then
+            return false, 'Ownership changed before the trade-in completed.'
+        end
+
+        -- Block trade-in if vehicle is under active financing
+        local activeFinancing = MySQL.scalar.await(
+            "SELECT COUNT(*) FROM `pickle_dealership_financing` WHERE `vehicle_plate` = ? AND `status` = 'active'",
+            { plate }
+        )
+        if activeFinancing and tonumber(activeFinancing) > 0 then
+            return false, 'This vehicle is under active financing and cannot be traded in.'
+        end
+
+        -- Reconcile any delivered orders before balance checks.
+        ProcessDeliveredOrders(dealership.id, transaction)
+
+        -- Balance check
+        if dealership.balance < buyPrice then
+            return false, 'Insufficient dealership funds.'
+        end
+
+        -- Derive condition from health (0-1000 in props.bodyHealth/engineHealth → percent)
+        local props = properties
+        if type(props) == 'string' then props = json.decode(props) or {} end
+        local body = tonumber(props.bodyHealth) or 1000
+        local engine = tonumber(props.engineHealth) or 1000
+        local condition = math.max(0, math.min(100, ((body + engine) / 2) / 10))
+
+        local catalog = MySQL.single.await('SELECT label FROM pickle_wholesale_catalog WHERE model = ?', { model })
+        local label = (catalog and catalog.label) or model
+
+        if GetIdentifier(sellerSource)~=sellerIdentifier then return false,'Seller session changed.' end
+        local currentOwner=GetOwnedVehicleFromPlate(plate)
+        if not currentOwner or currentOwner.owner~=sellerIdentifier then return false,'Ownership changed.' end
+        if RemoveOwnedVehicle(sellerIdentifier,plate)~=true then return false,'Ownership removal failed.' end
+        if MySQL.update.await('UPDATE pickle_dealerships SET balance=balance-? WHERE id=? AND balance>=?',{buyPrice,dealership.id,buyPrice})~=1 then
+            DealerRestoreVehicle(sellerIdentifier,model,plate,props)
+            return false,'Insufficient dealership funds.'
+        end
+
+        -- Pay the seller (consent already confirmed above)
+        -- Seller payment is queued only after stock insertion succeeds.
+        ShowNotification(sellerSource, _L('stock_trade_in_seller', label, GetCurrencyString(buyPrice)))
+
+        -- Remove ownership from the seller's framework records
+        -- Ownership was claimed before the dealership debit.
+
+        -- Insert pre-owned stock row (captured vehicle properties stored in metadata)
+        local inserted,stockId=pcall(MySQL.insert.await,
+            'INSERT INTO pickle_dealership_stock (dealership_id, vehicle_model, vehicle_label, wholesale_cost, retail_price, ordered_at, delivered_at, quantity, is_used, metadata, plate, acquired_from, `condition`) VALUES (?, ?, ?, ?, ?, NOW(), NOW(), 1, 1, ?, ?, ?, ?)',
+            {
+                dealership.id, model, label, buyPrice, retailPrice,
+                json.encode(props), plate, sellerIdentifier, condition,
+            }
+        )
+
+        if not inserted or not stockId then
+            DealerRestoreVehicle(sellerIdentifier,model,plate,props)
+            MySQL.update.await('UPDATE pickle_dealerships SET balance=balance+? WHERE id=?',{buyPrice,dealership.id})
+            return false,'Trade-in stock insertion failed; ownership recovery queued.'
+        end
+        DealerCredit(sellerIdentifier,buyPrice,'bank' ,'trade-in:'..tostring(stockId))
+        AddLedgerEntry(dealership.id, 'expense', -buyPrice, 'Trade-in: ' .. label .. ' (' .. plate .. ')', identifier)
+
+        ShowNotification(source, _L('stock_trade_in_buyer', label, GetCurrencyString(buyPrice)))
+        TriggerClientEvent('pickle_dealerships:refreshDisplay', -1, locationKey)
+
+        -- Authoritative server-side delete. Client-side DeleteEntity silently
+        -- fails when the manager running the trade-in doesn't own the vehicle's
+        -- network entity; deleting from the server handles it regardless of owner.
+        local netId = tonumber(payload.netId)
+        if netId then
+            local ent = NetworkGetEntityFromNetworkId(netId)
+            if ent and ent ~= 0 and DoesEntityExist(ent) then
+                DeleteEntity(ent)
+            end
+        end
+
+        return true, stockId
+    end, true)
 end)
 
 --- Returns seize-enabled dealerships that this player can manage
@@ -1306,112 +1310,114 @@ end)
 
 --- Manager seizes a vehicle (no consent, no payment, unlisted by default)
 lib.callback.register('pickle_dealerships:seizeVehicle', function(source, data)
-    local identifier = GetIdentifier(source)
-    if not identifier then return false, 'Unable to identify player.' end
-    if type(data) ~= 'table' then return false, 'Invalid payload.' end
+    return DealerTransaction(source, function(transaction)
+        local identifier = GetIdentifier(source)
+        if not identifier then return false, 'Unable to identify player.' end
+        if type(data) ~= 'table' then return false, 'Invalid payload.' end
 
-    local dealershipId = tonumber(data.dealershipId)
-    local plate = data.plate and string.upper(tostring(data.plate):gsub('^%s*(.-)%s*$', '%1')) or nil
-    local properties = data.properties
+        local dealershipId = tonumber(data.dealershipId)
+        local plate = data.plate and string.upper(tostring(data.plate):gsub('^%s*(.-)%s*$', '%1')) or nil
+        local properties = data.properties
 
-    if not dealershipId or not plate or not properties then return false, 'Missing data.' end
+        if not dealershipId or not plate or not properties then return false, 'Missing data.' end
 
-    local dealership = MySQL.single.await('SELECT * FROM pickle_dealerships WHERE id = ?', { dealershipId })
-    if not dealership then return false, 'Dealership not found.' end
-    if not dealership.seize_enabled or dealership.seize_enabled == 0 or dealership.seize_enabled == false then return false, 'Seize mode is not enabled for this dealership.' end
-    if not CanPlayerManageOps(source, dealership.id) then return false, 'You do not have permission.' end
+        local dealership = MySQL.single.await('SELECT * FROM pickle_dealerships WHERE id = ?', { dealershipId })
+        if not dealership then return false, 'Dealership not found.' end
+        if not dealership.seize_enabled or dealership.seize_enabled == 0 or dealership.seize_enabled == false then return false, 'Seize mode is not enabled for this dealership.' end
+        if not CanPlayerManageOps(source, dealership.id) then return false, 'You do not have permission.' end
 
-    -- Only player-owned vehicles can be seized. NPC / unregistered vehicles are rejected.
-    local owned = GetOwnedVehicleFromPlate(plate)
-    if not owned or not owned.owner then
-        return false, 'Only player-owned vehicles can be seized.'
-    end
+        -- Only player-owned vehicles can be seized. NPC / unregistered vehicles are rejected.
+        local owned = GetOwnedVehicleFromPlate(plate)
+        if not owned or not owned.owner then
+            return false, 'Only player-owned vehicles can be seized.'
+        end
 
-    -- Prefer the framework-stored model name, but fall back to the client-supplied
-    -- name (resolved from the entity hash) when the bridge doesn't persist the model.
-    local model = type(owned.model)=='string' and owned.model or nil
-    if (not model or model == '') and data.modelName and data.modelName ~= '' then
-        model = tostring(data.modelName):lower()
-    end
-    if not model then return false, 'Could not resolve vehicle model.' end
+        -- Prefer the framework-stored model name, but fall back to the client-supplied
+        -- name (resolved from the entity hash) when the bridge doesn't persist the model.
+        local model = type(owned.model)=='string' and owned.model or nil
+        if (not model or model == '') and data.modelName and data.modelName ~= '' then
+            model = tostring(data.modelName):lower()
+        end
+        if not model then return false, 'Could not resolve vehicle model.' end
 
-    -- Reconcile any delivered orders so counts stay consistent.
-    ProcessDeliveredOrders(dealership.id)
+        -- Reconcile any delivered orders so counts stay consistent.
+        ProcessDeliveredOrders(dealership.id, transaction)
 
-    -- Derive condition from health
-    local props = properties
-    if type(props) == 'string' then props = json.decode(props) or {} end
-    local body = tonumber(props.bodyHealth) or 1000
-    local engine = tonumber(props.engineHealth) or 1000
-    local condition = math.max(0, math.min(100, ((body + engine) / 2) / 10))
+        -- Derive condition from health
+        local props = properties
+        if type(props) == 'string' then props = json.decode(props) or {} end
+        local body = tonumber(props.bodyHealth) or 1000
+        local engine = tonumber(props.engineHealth) or 1000
+        local condition = math.max(0, math.min(100, ((body + engine) / 2) / 10))
 
-    local catalog = MySQL.single.await('SELECT label FROM pickle_wholesale_catalog WHERE model = ?', { model })
-    local label = (catalog and catalog.label) or (data.label and data.label ~= '' and data.label) or model
+        local catalog = MySQL.single.await('SELECT label FROM pickle_wholesale_catalog WHERE model = ?', { model })
+        local label = (catalog and catalog.label) or (data.label and data.label ~= '' and data.label) or model
 
-    -- Remove ownership if the vehicle is registered
-    local previousOwner = nil
-    if owned and owned.owner then
-        previousOwner = owned.owner
-        if RemoveOwnedVehicle(owned.owner, plate)~=true then return false,'Ownership removal failed.' end
-    end
+        -- Remove ownership if the vehicle is registered
+        local previousOwner = nil
+        if owned and owned.owner then
+            previousOwner = owned.owner
+            if RemoveOwnedVehicle(owned.owner, plate)~=true then return false,'Ownership removal failed.' end
+        end
 
-    -- Cancel any active financing on this vehicle (no refund — the player loses the vehicle)
-    local activeLoan = MySQL.single.await(
-        "SELECT id, identifier, dealership_id FROM pickle_dealership_financing WHERE vehicle_plate = ? AND status = 'active'",
-        { plate }
-    )
-    if activeLoan then
-        MySQL.update.await(
-            "UPDATE pickle_dealership_financing SET status = 'repossessed' WHERE id = ?",
-            { activeLoan.id }
+        -- Cancel any active financing on this vehicle (no refund — the player loses the vehicle)
+        local activeLoan = MySQL.single.await(
+            "SELECT id, identifier, dealership_id FROM pickle_dealership_financing WHERE vehicle_plate = ? AND status = 'active'",
+            { plate }
         )
-        AddLedgerEntry(activeLoan.dealership_id, "repossession", 0, ("Vehicle seized — financing cancelled: plate %s"):format(plate), activeLoan.identifier)
-        local debtorSource = GetSourceFromIdentifier(activeLoan.identifier)
-        if debtorSource then
-            TriggerClientEvent("pickle_dealerships:vehicleRepossessed", debtorSource, {
-                plate = plate,
-                missedPayments = 0,
-            })
+        if activeLoan then
+            MySQL.update.await(
+                "UPDATE pickle_dealership_financing SET status = 'repossessed' WHERE id = ?",
+                { activeLoan.id }
+            )
+            AddLedgerEntry(activeLoan.dealership_id, "repossession", 0, ("Vehicle seized — financing cancelled: plate %s"):format(plate), activeLoan.identifier)
+            local debtorSource = GetSourceFromIdentifier(activeLoan.identifier)
+            if debtorSource then
+                TriggerClientEvent("pickle_dealerships:vehicleRepossessed", debtorSource, {
+                    plate = plate,
+                    missedPayments = 0,
+                })
+            end
         end
-    end
 
-    -- Insert as unlisted pre-owned stock (no cost to dealership)
-    local inserted,stockId=pcall(MySQL.insert.await,
-        'INSERT INTO pickle_dealership_stock (dealership_id, vehicle_model, vehicle_label, wholesale_cost, retail_price, ordered_at, delivered_at, quantity, is_used, unlisted, metadata, plate, acquired_from, `condition`) VALUES (?, ?, ?, 0, 0, NOW(), NOW(), 1, 1, 1, ?, ?, ?, ?)',
-        {
-            dealership.id, model, label,
-            json.encode(props), plate, previousOwner or 'seized', condition,
-        }
-    )
+        -- Insert as unlisted pre-owned stock (no cost to dealership)
+        local inserted,stockId=pcall(MySQL.insert.await,
+            'INSERT INTO pickle_dealership_stock (dealership_id, vehicle_model, vehicle_label, wholesale_cost, retail_price, ordered_at, delivered_at, quantity, is_used, unlisted, metadata, plate, acquired_from, `condition`) VALUES (?, ?, ?, 0, 0, NOW(), NOW(), 1, 1, 1, ?, ?, ?, ?)',
+            {
+                dealership.id, model, label,
+                json.encode(props), plate, previousOwner or 'seized', condition,
+            }
+        )
 
-    if not inserted or not stockId then
-        DealerRestoreVehicle(previousOwner,model,plate,props)
-        if activeLoan then MySQL.update.await("UPDATE pickle_dealership_financing SET status='active' WHERE id=?",{activeLoan.id}) end
-        return false,'Seizure could not be committed; ownership recovery queued.'
-    end
-    AddLedgerEntry(dealership.id, 'seize' , 0, 'Seized: ' .. label .. ' (' .. plate .. ')' .. (previousOwner and (' from ' .. previousOwner) or ''), identifier)
-
-    ShowNotification(source, _L('seize_success', label, plate))
-    TriggerClientEvent('pickle_dealerships:refreshDisplay', -1, dealership.location)
-
-    -- Authoritative server-side delete (see tradeInVehicle for rationale).
-    local netId = tonumber(data.netId)
-    if netId then
-        local ent = NetworkGetEntityFromNetworkId(netId)
-        if ent and ent ~= 0 and DoesEntityExist(ent) then
-            DeleteEntity(ent)
+        if not inserted or not stockId then
+            DealerRestoreVehicle(previousOwner,model,plate,props)
+            if activeLoan then MySQL.update.await("UPDATE pickle_dealership_financing SET status='active' WHERE id=?",{activeLoan.id}) end
+            return false,'Seizure could not be committed; ownership recovery queued.'
         end
-    end
+        AddLedgerEntry(dealership.id, 'seize' , 0, 'Seized: ' .. label .. ' (' .. plate .. ')' .. (previousOwner and (' from ' .. previousOwner) or ''), identifier)
 
-    return true, stockId
+        ShowNotification(source, _L('seize_success', label, plate))
+        TriggerClientEvent('pickle_dealerships:refreshDisplay', -1, dealership.location)
+
+        -- Authoritative server-side delete (see tradeInVehicle for rationale).
+        local netId = tonumber(data.netId)
+        if netId then
+            local ent = NetworkGetEntityFromNetworkId(netId)
+            if ent and ent ~= 0 and DoesEntityExist(ent) then
+                DeleteEntity(ent)
+            end
+        end
+
+        return true, stockId
+    end, true)
 end)
 
 --- On-demand: process any delivered orders for a dealership
 --- Moves delivered orders from pickle_dealership_orders into pickle_dealership_stock (stacking onto existing stock)
-function ProcessDeliveredOrders(id)
+function ProcessDeliveredOrders(id, operation)
     return DealerRunMutation(function()
         local rows=MySQL.query.await('SELECT id FROM pickle_dealership_orders WHERE dealership_id=? AND delivered_at IS NOT NULL AND delivered_at<=NOW() AND claimed_by IS NULL',{id}) or {}
         local ids={}; for _,row in ipairs(rows) do ids[#ids+1]=row.id end
         return DealerCommitOrders(ids)
-    end)
+    end, operation)
 end

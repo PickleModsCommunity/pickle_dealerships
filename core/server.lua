@@ -1145,23 +1145,22 @@ end
 
 _G.PickleStockLocks = _G.PickleStockLocks or {}
 
-local heldStock={}
-function AcquireStockLock(stockId)
-    local id=tonumber(stockId); local owner=coroutine.running()
-    if not id or id%1~=0 or _G.PickleStockLocks[id] then return false end
-    local token={owner=owner}; _G.PickleStockLocks[id]=token
-    heldStock[owner]=heldStock[owner] or {}; heldStock[owner][id]=token
+function AcquireStockLock(stockId, operation)
+    local id = tonumber(stockId)
+    if not id or id%1 ~= 0 or not operation or _G.PickleStockLocks[id] then return false end
+    _G.PickleStockLocks[id] = operation
+    operation.stockLocks[id] = true
     return true
 end
-function ReleaseStockLock(stockId)
-    local id=tonumber(stockId); local owner=coroutine.running()
-    local token=heldStock[owner] and heldStock[owner][id]
-    if token and _G.PickleStockLocks[id]==token then _G.PickleStockLocks[id]=nil; heldStock[owner][id]=nil end
+function ReleaseStockLock(stockId, operation)
+    local id = tonumber(stockId)
+    if operation and _G.PickleStockLocks[id] == operation then
+        _G.PickleStockLocks[id] = nil
+        operation.stockLocks[id] = nil
+    end
 end
-function ReleaseDealerOperationLocks()
-    local owner=coroutine.running()
-    for id,token in pairs(heldStock[owner] or {}) do if _G.PickleStockLocks[id]==token then _G.PickleStockLocks[id]=nil end end
-    heldStock[owner]=nil
+function ReleaseDealerOperationLocks(operation)
+    for id in pairs(operation.stockLocks) do ReleaseStockLock(id, operation) end
 end
 
 -- oxmysql on this server returns SQL NULL DATETIME columns as the number 0
