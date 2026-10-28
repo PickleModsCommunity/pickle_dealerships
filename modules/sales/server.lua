@@ -51,6 +51,7 @@ RegisterNetEvent('pickle_dealerships:leaveTestDriveBucket', function()
 end)
 
 AddEventHandler('playerDropped', function()
+    DealerOffers[source] = nil
     LeaveTestDriveBucket(source)
 end)
 
@@ -96,7 +97,7 @@ end
 -- `identifier` is the buyer's stable player id; when provided we also enforce
 -- the per-player cap (`max_uses_per_player`) and record the redemption in
 -- pickle_dealership_coupon_uses so the next redemption sees the new total.
-function ValidateCoupon(dealershipId, code, purchasePrice, identifier)
+function ValidateCoupon(dealershipId, code, purchasePrice, identifier, stock, transaction)
     if not code or code == "" then return nil end
     local rows = MySQL.query.await(
         "SELECT * FROM `pickle_dealership_coupons` WHERE `dealership_id` = ? AND `code` = ? LIMIT 1",
@@ -134,8 +135,8 @@ function ValidateCoupon(dealershipId, code, purchasePrice, identifier)
     -- Belt and braces: never let the discount exceed the price itself.
     if discount > purchasePrice then discount = purchasePrice end
 
-    if not DealerCouponAllowed(coupon,DealerCurrentStock()) then return nil end
-    DealerQueueCoupon(coupon,identifier)
+    if not DealerCouponAllowed(coupon, stock) then return nil end
+    DealerQueueCoupon(transaction, coupon, identifier)
 
     return discount, coupon
 end
@@ -228,7 +229,7 @@ local function PlayerMeetsMinGrade(source, dealership, stockItem)
     end
 end
 
-local function ProcessSale(source, dealershipId, stockItem, paymentMethod, couponCode, soldByCitizenid, addons)
+local function ProcessSale(source, dealershipId, stockItem, paymentMethod, couponCode, soldByCitizenid, addons, transaction)
     local identifier = GetIdentifier(source)
     if not identifier then return false, "Could not identify player." end
 
@@ -246,7 +247,7 @@ local function ProcessSale(source, dealershipId, stockItem, paymentMethod, coupo
     local price = stockItem.retail_price
     local discount = 0
     if couponCode and couponCode ~= "" then
-        discount = ValidateCoupon(dealershipId, couponCode, price, identifier) or 0
+        discount = ValidateCoupon(dealershipId, couponCode, price, identifier, stockItem, transaction) or 0
     end
     local finalPrice = math.max(0, price - discount)
 
@@ -265,6 +266,7 @@ local function ProcessSale(source, dealershipId, stockItem, paymentMethod, coupo
     finalPrice = finalPrice + (addonCost or 0)
 
     local societyEntry = nil
+    local paidCurrency
     local altCurrencyUsed = nil -- populated when paymentMethod begins with "alt:"
     if type(paymentMethod) == "string" and paymentMethod:sub(1, 4) == "alt:" then
         local key = paymentMethod:sub(5)
@@ -338,6 +340,7 @@ local function ProcessSale(source, dealershipId, stockItem, paymentMethod, coupo
 
         -- Deduct money
         if RemoveMoney(source,finalPrice,currency)~=true then return false,"Payment rejected" end
+        paidCurrency = currency
     end
 
     -- Register vehicle with a single, authoritative plate
@@ -395,8 +398,21 @@ local function ProcessSale(source, dealershipId, stockItem, paymentMethod, coupo
             props.color2 = chosen
         end
     end
-    if AddOwnedVehicleWithProps(source,stockItem.vehicle_model,plate,props)~=true then error('Vehicle ownership insert rejected') end
-    DealerGrantedVehicle(source,plate)
+    if AddOwnedVehicleWithProps(source,stockItem.vehicle_model,plate,props)~=true then
+        -- Refund only this confirmed payment when ownership registration rejects it.
+        if societyEntry then
+            AddSocietyMoney(societyEntry.name, finalPrice)
+        elseif GetIdentifier(source) == identifier then
+            if altCurrencyUsed then
+                local def = GetAltCurrency(altCurrencyUsed.key)
+                if def and def.add then def.add(source, altCurrencyUsed.native) end
+            elseif paidCurrency then
+                AddMoney(source, finalPrice, paidCurrency)
+            end
+        end
+        return false, 'Vehicle ownership insert rejected.'
+    end
+
 
 
     -- Mark stock as sold
@@ -624,240 +640,259 @@ lib.callback.register("pickle_dealerships:listNearbyPlayers", function(source, d
 end)
 
 lib.callback.register("pickle_dealerships:purchaseVehicle", function(source, data)
-    local dealershipId = tonumber(data.dealershipId)
-    local stockId = tonumber(data.stockId)
-    local paymentMethod = data.paymentMethod or "cash"
-    local couponCode = data.couponCode
-    if not dealershipId or not stockId then
-        return { success = false, message = "Invalid request." }
-    end
+    return DealerTransaction(source, function(transaction)
+        if type(data) ~= 'table' then return {success=false, message='Invalid request.'} end
+        local dealershipId = tonumber(data.dealershipId)
+        local stockId = tonumber(data.stockId)
+        local paymentMethod = data.paymentMethod or "cash"
+        local couponCode = data.couponCode
+        if not dealershipId or not stockId then
+            return { success = false, message = "Invalid request." }
+        end
 
-    if not AcquireStockLock(stockId) then
-        return { success = false, message = "Vehicle has already been sold." }
-    end
+        if not AcquireStockLock(stockId, transaction) then
+            return { success = false, message = "Vehicle has already been sold." }
+        end
 
-    local dealership = GetDealership(dealershipId)
-    if not dealership then
-        ReleaseStockLock(stockId)
-        return { success = false, message = "Dealership not found." }
-    end
+        local dealership = GetDealership(dealershipId)
+        if not dealership then
+            ReleaseStockLock(stockId, transaction)
+            return { success = false, message = "Dealership not found." }
+        end
 
-    -- "Speak to an employee" mode: when the owner has disabled customer
-    -- self-purchase, only employees may run a purchase through this callback.
-    -- Employee-driven sales go through `confirmEmployeeSale` and are unaffected.
-    local meta = dealership.metadata
-    if type(meta) == "string" then meta = json.decode(meta) or {} end
-    if type(meta) == "table" and meta.disableSelfPurchase == true and not CanPlayerSell(source, dealershipId) then
-        ReleaseStockLock(stockId)
-        return { success = false, message = _L("error_self_purchase_disabled") }
-    end
+        -- "Speak to an employee" mode: when the owner has disabled customer
+        -- self-purchase, only employees may run a purchase through this callback.
+        -- Employee-driven sales go through `confirmEmployeeSale` and are unaffected.
+        local meta = dealership.metadata
+        if type(meta) == "string" then meta = json.decode(meta) or {} end
+        if type(meta) == "table" and meta.disableSelfPurchase == true and not CanPlayerSell(source, dealershipId) then
+            ReleaseStockLock(stockId, transaction)
+            return { success = false, message = _L("error_self_purchase_disabled") }
+        end
 
-    local stockItem = GetStockItem(stockId)
-    if not stockItem then
-        ReleaseStockLock(stockId)
-        return { success = false, message = "Vehicle not found in stock." }
-    end
-    if stockItem.dealership_id ~= dealershipId then
-        ReleaseStockLock(stockId)
-        return { success = false, message = "Vehicle does not belong to this dealership." }
-    end
-    if not stockItem.delivered_at then
-        ReleaseStockLock(stockId)
-        return { success = false, message = "Vehicle has not been delivered yet." }
-    end
-    if stockItem.sold_at then
-        ReleaseStockLock(stockId)
-        return { success = false, message = "Vehicle has already been sold." }
-    end
-    if stockItem.unlisted == 1 or stockItem.unlisted == true then
-        ReleaseStockLock(stockId)
-        return { success = false, message = "This vehicle is not available for purchase." }
-    end
+        local stockItem = GetStockItem(stockId)
+        if not stockItem then
+            ReleaseStockLock(stockId, transaction)
+            return { success = false, message = "Vehicle not found in stock." }
+        end
+        if stockItem.dealership_id ~= dealershipId then
+            ReleaseStockLock(stockId, transaction)
+            return { success = false, message = "Vehicle does not belong to this dealership." }
+        end
+        if not stockItem.delivered_at then
+            ReleaseStockLock(stockId, transaction)
+            return { success = false, message = "Vehicle has not been delivered yet." }
+        end
+        if stockItem.sold_at then
+            ReleaseStockLock(stockId, transaction)
+            return { success = false, message = "Vehicle has already been sold." }
+        end
+        if stockItem.unlisted == 1 or stockItem.unlisted == true then
+            ReleaseStockLock(stockId, transaction)
+            return { success = false, message = "This vehicle is not available for purchase." }
+        end
 
-    local success, plate, finalPrice = ProcessSale(source, dealershipId, stockItem, paymentMethod, couponCode, nil, data.addons)
-    ReleaseStockLock(stockId)
-    if not success then
-        return { success = false, message = plate } -- plate holds error message on failure
-    end
+        local success, plate, finalPrice = ProcessSale(source, dealershipId, stockItem, paymentMethod, couponCode, nil, data.addons, transaction)
+        ReleaseStockLock(stockId, transaction)
+        if not success then
+            return { success = false, message = plate } -- plate holds error message on failure
+        end
 
-    -- If the customer redeemed an inventory coupon item via the picker, burn
-    -- one copy. The discount itself was already applied inside ProcessSale.
-    if couponCode and couponCode ~= "" and data.couponItemSlot then
-        ConsumeCouponItem(source, data.couponItemSlot)
-    end
+        -- If the customer redeemed an inventory coupon item via the picker, burn
+        -- one copy. The discount itself was already applied inside ProcessSale.
+        if couponCode and couponCode ~= "" and data.couponItemSlot then
+            ConsumeCouponItem(source, data.couponItemSlot)
+        end
 
-    return {
-        success = true,
-        plate = plate,
-        price = finalPrice,
-        model = stockItem.vehicle_model,
-        label = stockItem.vehicle_label or stockItem.vehicle_model,
-        -- Surface the dealership's location key so the client picks up
-        -- the correct spawnPoint from DealershipConfigs instead of the
-        -- first dealership it happens to iterate over.
-        location = dealership.location,
-    }
+        return {
+            success = true,
+            plate = plate,
+            price = finalPrice,
+            model = stockItem.vehicle_model,
+            label = stockItem.vehicle_label or stockItem.vehicle_model,
+            -- Surface the dealership's location key so the client picks up
+            -- the correct spawnPoint from DealershipConfigs instead of the
+            -- first dealership it happens to iterate over.
+            location = dealership.location,
+        }
+    end)
 end)
 
 lib.callback.register("pickle_dealerships:employeeSale", function(source, data)
-    local dealershipId = tonumber(data.dealershipId)
-    local stockId = tonumber(data.stockId)
-    local targetPlayerId = tonumber(data.targetPlayerId)
-    local couponCode = data.couponCode
-    if not dealershipId or not stockId or not targetPlayerId then
-        return { success = false, message = "Invalid request." }
-    end
+    return DealerTransaction(source, function(transaction)
+        if type(data) ~= 'table' then return {success=false, message='Invalid request.'} end
+        if data.price ~= nil and not DealerInt(tonumber(data.price), 0, 2147483647) then return {success=false, message='Invalid price.'} end
+        local dealershipId = tonumber(data.dealershipId)
+        local stockId = tonumber(data.stockId)
+        local targetPlayerId = tonumber(data.targetPlayerId)
+        local couponCode = data.couponCode
+        if not dealershipId or not stockId or not targetPlayerId then
+            return { success = false, message = "Invalid request." }
+        end
 
-    -- Verify the employee can sell
-    if not CanPlayerSell(source, dealershipId) then
-        return { success = false, message = "You do not have permission to sell vehicles." }
-    end
+        -- Verify the employee can sell
+        if not CanPlayerSell(source, dealershipId) then
+            return { success = false, message = "You do not have permission to sell vehicles." }
+        end
 
-    if not AcquireStockLock(stockId) then
-        return { success = false, message = "Vehicle has already been sold." }
-    end
+        if not AcquireStockLock(stockId, transaction) then
+            return { success = false, message = "Vehicle has already been sold." }
+        end
 
-    local dealership = GetDealership(dealershipId)
-    if not dealership then
-        ReleaseStockLock(stockId)
-        return { success = false, message = "Dealership not found." }
-    end
+        local dealership = GetDealership(dealershipId)
+        if not dealership then
+            ReleaseStockLock(stockId, transaction)
+            return { success = false, message = "Dealership not found." }
+        end
 
-    local stockItem = GetStockItem(stockId)
-    if not stockItem then
-        ReleaseStockLock(stockId)
-        return { success = false, message = "Vehicle not found in stock." }
-    end
-    if stockItem.dealership_id ~= dealershipId then
-        ReleaseStockLock(stockId)
-        return { success = false, message = "Vehicle does not belong to this dealership." }
-    end
-    if not stockItem.delivered_at then
-        ReleaseStockLock(stockId)
-        return { success = false, message = "Vehicle has not been delivered yet." }
-    end
-    if stockItem.sold_at then
-        ReleaseStockLock(stockId)
-        return { success = false, message = "Vehicle has already been sold." }
-    end
+        local stockItem = GetStockItem(stockId)
+        if not stockItem then
+            ReleaseStockLock(stockId, transaction)
+            return { success = false, message = "Vehicle not found in stock." }
+        end
+        if stockItem.dealership_id ~= dealershipId then
+            ReleaseStockLock(stockId, transaction)
+            return { success = false, message = "Vehicle does not belong to this dealership." }
+        end
+        if not stockItem.delivered_at then
+            ReleaseStockLock(stockId, transaction)
+            return { success = false, message = "Vehicle has not been delivered yet." }
+        end
+        if stockItem.sold_at then
+            ReleaseStockLock(stockId, transaction)
+            return { success = false, message = "Vehicle has already been sold." }
+        end
 
-    -- Verify target player exists
-    local targetName = GetPlayerName(targetPlayerId)
-    if not targetName then
-        ReleaseStockLock(stockId)
-        return { success = false, message = "Target player not found." }
-    end
+        -- Verify target player exists
+        local targetName = GetPlayerName(targetPlayerId)
+        if not targetName then
+            ReleaseStockLock(stockId, transaction)
+            return { success = false, message = "Target player not found." }
+        end
 
-    local sellerCitizenid = GetIdentifier(source)
+        local sellerCitizenid = GetIdentifier(source)
 
-    -- Use custom price if provided, otherwise use retail price
-    local salePrice = data.price and tonumber(data.price) or stockItem.retail_price
-    if salePrice and salePrice ~= stockItem.retail_price then
-        -- Update the retail price temporarily for this sale
-        stockItem.retail_price = salePrice
-    end
+        -- Use custom price if provided, otherwise use retail price
+        local salePrice = data.price and tonumber(data.price) or stockItem.retail_price
+        if salePrice and salePrice ~= stockItem.retail_price then
+            -- Update the retail price temporarily for this sale
+            stockItem.retail_price = salePrice
+        end
 
-    DealerOffers[targetPlayerId]={dealershipId=dealershipId,stockId=stockId,price=stockItem.retail_price,couponCode=couponCode,
-        soldBy=sellerCitizenid,buyer=GetIdentifier(targetPlayerId),expires=os.time()+120}
-    -- Trigger confirmation on the target player's client
-    TriggerClientEvent("pickle_dealerships:confirmPurchase", targetPlayerId, {
-        dealershipId = dealershipId,
-        stockId = stockId,
-        model = stockItem.vehicle_model,
-        label = stockItem.vehicle_label or stockItem.vehicle_model,
-        price = stockItem.retail_price,
-        couponCode = couponCode,
-        soldBy = sellerCitizenid,
-        sellerName = GetPlayerCharacterName(source),
-        -- Dealership location key so the customer's client resolves the
-        -- correct spawnPoint on its own DealershipConfigs.
-        location = dealership.location,
-    })
+        DealerOffers[targetPlayerId]={dealershipId=dealershipId,stockId=stockId,price=stockItem.retail_price,couponCode=couponCode,
+            soldBy=sellerCitizenid,buyer=GetIdentifier(targetPlayerId),expires=os.time()+120}
+        -- Trigger confirmation on the target player's client
+        TriggerClientEvent("pickle_dealerships:confirmPurchase", targetPlayerId, {
+            dealershipId = dealershipId,
+            stockId = stockId,
+            model = stockItem.vehicle_model,
+            label = stockItem.vehicle_label or stockItem.vehicle_model,
+            price = stockItem.retail_price,
+            couponCode = couponCode,
+            soldBy = sellerCitizenid,
+            sellerName = GetPlayerCharacterName(source),
+            -- Dealership location key so the customer's client resolves the
+            -- correct spawnPoint on its own DealershipConfigs.
+            location = dealership.location,
+        })
 
-    -- Release the inflight lock — the actual claim happens when the
-    -- customer confirms via confirmEmployeeSale, which re-acquires it.
-    ReleaseStockLock(stockId)
-    return { success = true, message = "Purchase confirmation sent to customer." }
+        -- Release the inflight lock — the actual claim happens when the
+        -- customer confirms via confirmEmployeeSale, which re-acquires it.
+        ReleaseStockLock(stockId, transaction)
+        return { success = true, message = "Purchase confirmation sent to customer." }
+    end)
 end)
 
 -- Handle confirmed employee sale from the target player
 lib.callback.register("pickle_dealerships:confirmEmployeeSale", function(source, data)
-    local dealershipId = tonumber(data.dealershipId)
-    local stockId = tonumber(data.stockId)
-    local paymentMethod = data.paymentMethod or "bank"
-    local couponCode = data.couponCode
-    local soldBy = data.soldBy
+    return DealerTransaction(source, function(transaction)
+        if type(data) ~= 'table' then return {success=false, message='Invalid request.'} end
+        local offer = DealerOffers[source]
+        if not offer or offer.buyer ~= GetIdentifier(source) or offer.expires < os.time() or offer.stockId ~= tonumber(data.stockId) then
+            return {success=false, message='Purchase offer has expired.'}
+        end
+        data = {dealershipId=offer.dealershipId, stockId=offer.stockId, price=offer.price,
+            couponCode=offer.couponCode, soldBy=offer.soldBy, paymentMethod=data.paymentMethod,
+            addons=data.addons, couponItemSlot=data.couponItemSlot}
+        local dealershipId = tonumber(data.dealershipId)
+        local stockId = tonumber(data.stockId)
+        local paymentMethod = data.paymentMethod or "bank"
+        local couponCode = data.couponCode
+        local soldBy = data.soldBy
 
-    if not dealershipId or not stockId then
-        return { success = false, message = "Invalid request." }
-    end
+        if not dealershipId or not stockId then
+            return { success = false, message = "Invalid request." }
+        end
 
-    if not AcquireStockLock(stockId) then
-        return { success = false, message = "Vehicle has already been sold." }
-    end
+        if not AcquireStockLock(stockId, transaction) then
+            return { success = false, message = "Vehicle has already been sold." }
+        end
 
-    local stockItem = GetStockItem(stockId)
-    if not stockItem then
-        ReleaseStockLock(stockId)
-        return { success = false, message = "Vehicle no longer available." }
-    end
-    if stockItem.sold_at then
-        ReleaseStockLock(stockId)
-        return { success = false, message = "Vehicle has already been sold." }
-    end
+        local stockItem = GetStockItem(stockId)
+        if not stockItem or stockItem.auction_id or stockItem.dealership_id ~= dealershipId then
+            ReleaseStockLock(stockId, transaction)
+            return { success = false, message = "Vehicle no longer available." }
+        end
+        if stockItem.sold_at then
+            ReleaseStockLock(stockId, transaction)
+            return { success = false, message = "Vehicle has already been sold." }
+        end
 
-    -- Override retail price if custom price was set
-    if data.price then
-        stockItem.retail_price = tonumber(data.price)
-    end
+        -- Override retail price if custom price was set
+        if data.price then
+            stockItem.retail_price = tonumber(data.price)
+        end
 
-    local dealership = GetDealership(dealershipId)
-    if not dealership then
-        ReleaseStockLock(stockId)
-        return { success = false, message = "Dealership not found." }
-    end
+        local dealership = GetDealership(dealershipId)
+        if not dealership then
+            ReleaseStockLock(stockId, transaction)
+            return { success = false, message = "Dealership not found." }
+        end
 
-    local success, plate, finalPrice = ProcessSale(source, dealershipId, stockItem, paymentMethod, couponCode, soldBy, data.addons)
-    ReleaseStockLock(stockId)
-    if not success then
-        -- Server-authored decline notification to the seller — the customer
-        -- failed payment or hit some other gate during ProcessSale.
+        local success, plate, finalPrice = ProcessSale(source, dealershipId, stockItem, paymentMethod, couponCode, soldBy, data.addons, transaction)
+        ReleaseStockLock(stockId, transaction)
+        if not success then
+            -- Server-authored decline notification to the seller — the customer
+            -- failed payment or hit some other gate during ProcessSale.
+            if soldBy then
+                local sellerSrc = GetSourceFromIdentifier and GetSourceFromIdentifier(soldBy) or nil
+                if sellerSrc then
+                    ShowNotification(sellerSrc, _L("sales_seller_declined",
+                        GetPlayerCharacterName and GetPlayerCharacterName(source) or GetPlayerName(source) or "Customer",
+                        stockItem.vehicle_label or stockItem.vehicle_model
+                    ))
+                end
+            end
+            return { success = false, message = plate }
+        end
+
+        if couponCode and couponCode ~= "" and data.couponItemSlot then
+            ConsumeCouponItem(source, data.couponItemSlot)
+        end
+
+        DealerOffers[source] = nil
+
+        -- Notify the seller their pending sale closed successfully.
         if soldBy then
             local sellerSrc = GetSourceFromIdentifier and GetSourceFromIdentifier(soldBy) or nil
             if sellerSrc then
-                ShowNotification(sellerSrc, _L("sales_seller_declined",
+                ShowNotification(sellerSrc, _L("sales_seller_success",
                     GetPlayerCharacterName and GetPlayerCharacterName(source) or GetPlayerName(source) or "Customer",
-                    stockItem.vehicle_label or stockItem.vehicle_model
+                    stockItem.vehicle_label or stockItem.vehicle_model,
+                    GetCurrencyString(finalPrice)
                 ))
             end
         end
-        return { success = false, message = plate }
-    end
 
-    if couponCode and couponCode ~= "" and data.couponItemSlot then
-        ConsumeCouponItem(source, data.couponItemSlot)
-    end
-
-    -- Notify the seller their pending sale closed successfully.
-    if soldBy then
-        local sellerSrc = GetSourceFromIdentifier and GetSourceFromIdentifier(soldBy) or nil
-        if sellerSrc then
-            ShowNotification(sellerSrc, _L("sales_seller_success",
-                GetPlayerCharacterName and GetPlayerCharacterName(source) or GetPlayerName(source) or "Customer",
-                stockItem.vehicle_label or stockItem.vehicle_model,
-                GetCurrencyString(finalPrice)
-            ))
-        end
-    end
-
-    return {
-        success = true,
-        plate = plate,
-        price = finalPrice,
-        model = stockItem.vehicle_model,
-        label = stockItem.vehicle_label or stockItem.vehicle_model,
-        location = dealership.location,
-    }
+        return {
+            success = true,
+            plate = plate,
+            price = finalPrice,
+            model = stockItem.vehicle_model,
+            label = stockItem.vehicle_label or stockItem.vehicle_model,
+            location = dealership.location,
+        }
+    end)
 end)
 
 --- Customer-fired event when they cancel the confirm or payment dialog.
@@ -992,4 +1027,11 @@ lib.callback.register("pickle_dealerships:getPickleFax", function(_, data)
         wholesaleCost = stockItem.wholesale_cost,
         properties = properties,
     }
+end)
+
+lib.callback.register('pickle_dealerships:authorizeTestDrive', function(source, data)
+    if type(data) ~= 'table' or type(data.model) ~= 'string' then return false end
+    local dealer = GetDealership(tonumber(data.dealershipId))
+    if not dealer or not PlayerCanAccessDealership(source, dealer) then return false end
+    return MySQL.scalar.await('SELECT 1 FROM pickle_dealership_stock WHERE dealership_id=? AND vehicle_model=? AND sold_at IS NULL AND auction_id IS NULL LIMIT 1', {dealer.id, data.model}) ~= nil
 end)

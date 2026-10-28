@@ -15,7 +15,24 @@ local function GetStockItem(stockId)
     return row
 end
 
-local function MarkStockSold(id,buyer,seller) return DealerMarkStockSold(id,buyer,seller) end
+local function MarkStockSold(stockId,buyer,seller)
+    local stock=MySQL.single.await('SELECT * FROM pickle_dealership_stock WHERE id=?',{stockId})
+    if not stock or stock.sold_at or stock.auction_id then error('Stock is no longer available') end
+    if tonumber(stock.quantity or 1)>1 then
+        local ok=MySQL.transaction.await({
+            {query='UPDATE pickle_dealership_stock SET quantity=quantity-1 WHERE id=? AND sold_at IS NULL AND quantity>1',values={stockId}},
+            {query=[[
+                INSERT INTO pickle_dealership_stock (dealership_id,vehicle_model,vehicle_label,wholesale_cost,retail_price,quantity,ordered_at,delivered_at,sold_at,sold_to,sold_by,acquired_from)
+                VALUES (?,?,?,?,?,1,NOW(),NOW(),NOW(),?,?,?)
+            ]],values={stock.dealership_id,stock.vehicle_model,stock.vehicle_label,stock.wholesale_cost,stock.retail_price,buyer,seller or buyer,stock.acquired_from or 'finance_sale'}},
+        })
+        if not ok then error('Stock split failed') end
+    else
+        local rows=MySQL.update.await('UPDATE pickle_dealership_stock SET sold_at=NOW(),sold_to=?,sold_by=? WHERE id=? AND sold_at IS NULL AND auction_id IS NULL',{buyer,seller,stockId})
+        if rows~=1 then error('Stock claim failed') end
+    end
+    return true
+end
 
 local function AddDealershipBalance(dealershipId, amount)
     MySQL.update.await(
@@ -158,301 +175,310 @@ lib.callback.register("pickle_dealerships:getPlayerBalances", function(source)
 end)
 
 lib.callback.register("pickle_dealerships:createFinancing", function(source, data)
-    local dealershipId = tonumber(data.dealershipId)
-    local stockId = tonumber(data.stockId)
-    local downPayment = tonumber(data.downPayment) or 0
-    local installments = tonumber(data.installments) or 12
-    local paymentMethod = data.paymentMethod == "cash" and "money" or "bank"
+    return DealerTransaction(source, function(transaction)
+        if type(data) ~= 'table' then return {success=false, message='Invalid request.'} end
+        local dealershipId = tonumber(data.dealershipId)
+        local stockId = tonumber(data.stockId)
+        local downPayment = tonumber(data.downPayment) or 0
+        local installments = tonumber(data.installments) or 12
+        local paymentMethod = data.paymentMethod == "cash" and "money" or "bank"
 
-    if not dealershipId or not stockId then
-        return { success = false, message = "Invalid request." }
-    end
-
-    local dealership = GetDealership(dealershipId)
-    if not dealership then
-        return { success = false, message = "Dealership not found." }
-    end
-
-    -- Financing is no longer tier-gated. The dealership-level toggle below
-    -- (settings.financingEnabled) is the only remaining gate, so owners can
-    -- still opt out per-shop without admin intervention.
-    local settings = GetFinancingSettings(dealershipId)
-    if not settings.financingEnabled then
-        return { success = false, message = "Financing is currently disabled at this dealership." }
-    end
-
-    -- Same self-purchase gate as the cash/bank path. Customers must talk to an
-    -- employee when this toggle is on; the employee uses the tablet flow.
-    local meta = dealership.metadata
-    if type(meta) == "string" then meta = json.decode(meta) or {} end
-    if type(meta) == "table" and meta.disableSelfPurchase == true and not CanPlayerSell(source, dealershipId) then
-        return { success = false, message = _L("error_self_purchase_disabled") }
-    end
-
-    if not AcquireStockLock(stockId) then
-        return { success = false, message = "Vehicle has already been sold." }
-    end
-
-    local stockItem = GetStockItem(stockId)
-    if not stockItem then
-        ReleaseStockLock(stockId)
-        return { success = false, message = "Vehicle not found in stock." }
-    end
-    if stockItem.dealership_id ~= dealershipId then
-        ReleaseStockLock(stockId)
-        return { success = false, message = "Vehicle does not belong to this dealership." }
-    end
-    if not stockItem.delivered_at then
-        ReleaseStockLock(stockId)
-        return { success = false, message = "Vehicle has not been delivered yet." }
-    end
-    if stockItem.sold_at then
-        ReleaseStockLock(stockId)
-        return { success = false, message = "Vehicle has already been sold." }
-    end
-    if stockItem.auction_id then
-        ReleaseStockLock(stockId)
-        return { success = false, message = "Vehicle is currently at auction." }
-    end
-
-    -- Validate installment count is in the allowed options
-    local validInstallments = false
-    for _, opt in ipairs(settings.installmentOptions or { 4, 8, 12 }) do
-        if opt == installments then validInstallments = true break end
-    end
-    if not validInstallments then
-        ReleaseStockLock(stockId)
-        return { success = false, message = "Invalid installment plan." }
-    end
-
-    -- Coupon: applied to the vehicle's retail price BEFORE the down/financed
-    -- split, so the minimum-down% is calculated on the discounted price and
-    -- interest accrues on the lower financed balance. ValidateCoupon atomically
-    -- increments the uses counter, so we only call it once we know the rest of
-    -- the deal is going through (after stock + installment validation).
-    local price = stockItem.retail_price
-    local couponDiscount = 0
-    local couponRow = nil
-    if data.couponCode and data.couponCode ~= "" then
-        couponDiscount, couponRow = ValidateCoupon(dealershipId, data.couponCode, price, GetIdentifier(source))
-        if not couponDiscount or couponDiscount <= 0 then
-            ReleaseStockLock(stockId)
-            return { success = false, message = _L("coupon_invalid") or "Invalid coupon code." }
+        if not dealershipId or not stockId then
+            return { success = false, message = "Invalid request." }
         end
-        price = math.max(0, price - couponDiscount)
-    end
-    if not DealerInt(downPayment,0,2147483647) or downPayment>=price then ReleaseStockLock(stockId); return {success=false,message="Down payment must leave a positive loan balance"} end
-    local minDown = math.floor(price * settings.minDownPercent / 100)
 
-    if downPayment < minDown then
-        ReleaseStockLock(stockId)
-        return { success = false, message = ("Minimum down payment is %s (%d%%)."):format(GetCurrencyString(minDown), settings.minDownPercent) }
-    end
-
-    -- Resolve add-ons. The add-on cost is charged on top of the down payment
-    -- (paid upfront at signing) — it does NOT get rolled into the loan
-    -- balance, otherwise the customer would pay interest on personalization.
-    -- Pre-owned units keep their existing plate, so the custom-plate add-on
-    -- is silently dropped for them.
-    local isUsedForAddon = stockItem.is_used == true or tonumber(stockItem.is_used) == 1
-    local addonsCleaned = data.addons
-    if isUsedForAddon and type(addonsCleaned) == "table" and addonsCleaned.customPlate then
-        local tmp = {}
-        for k, v in pairs(addonsCleaned) do tmp[k] = v end
-        tmp.customPlate = nil
-        addonsCleaned = tmp
-    end
-    local addonOk, addonCost, customPlate, addonErr = ResolvePurchaseAddons(price, addonsCleaned)
-    if not addonOk then
-        ReleaseStockLock(stockId)
-        return { success = false, message = addonErr }
-    end
-    addonCost = addonCost or 0
-
-    local identifier = GetIdentifier(source)
-    if not identifier then
-        ReleaseStockLock(stockId)
-        return { success = false, message = "Could not identify player." }
-    end
-
-    -- Credit score gate. Only runs when both (a) the dealership opted in and
-    -- (b) Config.CreditScore.enabled makes GetPlayerCreditScore return a real
-    -- value. A nil score here means the provider is off/missing or doesn't
-    -- know this player — fail closed so missing data can't be used to bypass
-    -- the minimum.
-    if settings.requireCreditScore and IsCreditScoreProviderActive() then
-        local score = GetPlayerCreditScore(identifier)
-        if not score then
-            ReleaseStockLock(stockId)
-            return { success = false, message = _L("financing_credit_score_unavailable") }
+        local dealership = GetDealership(dealershipId)
+        if not dealership then
+            return { success = false, message = "Dealership not found." }
         end
-        local required = tonumber(settings.minCreditScore) or 600
-        if score < required then
-            ReleaseStockLock(stockId)
-            return { success = false, message = _L("financing_credit_score_too_low", required, score) }
+
+        -- Financing is no longer tier-gated. The dealership-level toggle below
+        -- (settings.financingEnabled) is the only remaining gate, so owners can
+        -- still opt out per-shop without admin intervention.
+        local settings = GetFinancingSettings(dealershipId)
+        if not settings.financingEnabled then
+            return { success = false, message = "Financing is currently disabled at this dealership." }
         end
-    end
 
-    local upfrontTotal = downPayment + addonCost
-    local playerMoney = GetMoney(source, paymentMethod)
-    if playerMoney < upfrontTotal then
-        ReleaseStockLock(stockId)
-        return { success = false, message = "Insufficient funds for down payment." }
-    end
+        -- Same self-purchase gate as the cash/bank path. Customers must talk to an
+        -- employee when this toggle is on; the employee uses the tablet flow.
+        local meta = dealership.metadata
+        if type(meta) == "string" then meta = json.decode(meta) or {} end
+        if type(meta) == "table" and meta.disableSelfPurchase == true and not CanPlayerSell(source, dealershipId) then
+            return { success = false, message = _L("error_self_purchase_disabled") }
+        end
 
-    -- Calculate financing details
-    local remainingBalance = price - downPayment
-    local interestRate = settings.interestRate / 100
-    local totalWithInterest = remainingBalance + math.floor(remainingBalance * interestRate)
-    local installmentAmount = math.ceil(totalWithInterest / installments)
+        if not AcquireStockLock(stockId, transaction) then
+            return { success = false, message = "Vehicle has already been sold." }
+        end
 
-    -- Deduct down payment + addon cost from the selected account
-    if RemoveMoney(source,upfrontTotal,paymentMethod)~=true then ReleaseStockLock(stockId); return {success=false,message="Payment rejected"} end
+        local stockItem = GetStockItem(stockId)
+        if not stockItem then
+            ReleaseStockLock(stockId, transaction)
+            return { success = false, message = "Vehicle not found in stock." }
+        end
+        if stockItem.dealership_id ~= dealershipId then
+            ReleaseStockLock(stockId, transaction)
+            return { success = false, message = "Vehicle does not belong to this dealership." }
+        end
+        if not stockItem.delivered_at then
+            ReleaseStockLock(stockId, transaction)
+            return { success = false, message = "Vehicle has not been delivered yet." }
+        end
+        if stockItem.sold_at then
+            ReleaseStockLock(stockId, transaction)
+            return { success = false, message = "Vehicle has already been sold." }
+        end
+        if stockItem.auction_id then
+            ReleaseStockLock(stockId, transaction)
+            return { success = false, message = "Vehicle is currently at auction." }
+        end
 
-    -- Register vehicle with a single, authoritative plate (matches the sales flow
-    -- so GetOwnedVehicleFromPlate resolves correctly for repossession / seize).
-    local isUsed = stockItem.is_used == 1 or stockItem.is_used == true
-    local plate
-    local properties
-    if isUsed and stockItem.plate and stockItem.plate ~= '' then
-        plate = stockItem.plate
-        properties = stockItem.metadata
-        if type(properties) == "string" then properties = json.decode(properties) or {} end
-        if type(properties) ~= "table" then properties = {} end
-        properties.plate = plate
-    else
-        plate = customPlate or GeneratePlate()
-        properties = { plate = plate }
-    end
-    if AddOwnedVehicleWithProps(source,stockItem.vehicle_model,plate,properties)~=true then error("Vehicle ownership insert rejected") end
-    DealerGrantedVehicle(source,plate)
+        -- Validate installment count is in the allowed options
+        local validInstallments = false
+        for _, opt in ipairs(settings.installmentOptions or { 4, 8, 12 }) do
+            if opt == installments then validInstallments = true break end
+        end
+        if not validInstallments then
+            ReleaseStockLock(stockId, transaction)
+            return { success = false, message = "Invalid installment plan." }
+        end
+
+        -- Coupon: applied to the vehicle's retail price BEFORE the down/financed
+        -- split, so the minimum-down% is calculated on the discounted price and
+        -- interest accrues on the lower financed balance. ValidateCoupon atomically
+        -- increments the uses counter, so we only call it once we know the rest of
+        -- the deal is going through (after stock + installment validation).
+        local price = stockItem.retail_price
+        local couponDiscount = 0
+        local couponRow = nil
+        if data.couponCode and data.couponCode ~= "" then
+            couponDiscount, couponRow = ValidateCoupon(dealershipId, data.couponCode, price, GetIdentifier(source), stockItem, transaction)
+            if not couponDiscount or couponDiscount <= 0 then
+                ReleaseStockLock(stockId, transaction)
+                return { success = false, message = _L("coupon_invalid") or "Invalid coupon code." }
+            end
+            price = math.max(0, price - couponDiscount)
+        end
+        if not DealerInt(downPayment,0,2147483647) or downPayment>=price then ReleaseStockLock(stockId, transaction); return {success=false,message="Down payment must leave a positive loan balance"} end
+        local minDown = math.floor(price * settings.minDownPercent / 100)
+
+        if downPayment < minDown then
+            ReleaseStockLock(stockId, transaction)
+            return { success = false, message = ("Minimum down payment is %s (%d%%)."):format(GetCurrencyString(minDown), settings.minDownPercent) }
+        end
+
+        -- Resolve add-ons. The add-on cost is charged on top of the down payment
+        -- (paid upfront at signing) — it does NOT get rolled into the loan
+        -- balance, otherwise the customer would pay interest on personalization.
+        -- Pre-owned units keep their existing plate, so the custom-plate add-on
+        -- is silently dropped for them.
+        local isUsedForAddon = stockItem.is_used == true or tonumber(stockItem.is_used) == 1
+        local addonsCleaned = data.addons
+        if isUsedForAddon and type(addonsCleaned) == "table" and addonsCleaned.customPlate then
+            local tmp = {}
+            for k, v in pairs(addonsCleaned) do tmp[k] = v end
+            tmp.customPlate = nil
+            addonsCleaned = tmp
+        end
+        local addonOk, addonCost, customPlate, addonErr = ResolvePurchaseAddons(price, addonsCleaned)
+        if not addonOk then
+            ReleaseStockLock(stockId, transaction)
+            return { success = false, message = addonErr }
+        end
+        addonCost = addonCost or 0
+
+        local identifier = GetIdentifier(source)
+        if not identifier then
+            ReleaseStockLock(stockId, transaction)
+            return { success = false, message = "Could not identify player." }
+        end
+
+        -- Credit score gate. Only runs when both (a) the dealership opted in and
+        -- (b) Config.CreditScore.enabled makes GetPlayerCreditScore return a real
+        -- value. A nil score here means the provider is off/missing or doesn't
+        -- know this player — fail closed so missing data can't be used to bypass
+        -- the minimum.
+        if settings.requireCreditScore and IsCreditScoreProviderActive() then
+            local score = GetPlayerCreditScore(identifier)
+            if not score then
+                ReleaseStockLock(stockId, transaction)
+                return { success = false, message = _L("financing_credit_score_unavailable") }
+            end
+            local required = tonumber(settings.minCreditScore) or 600
+            if score < required then
+                ReleaseStockLock(stockId, transaction)
+                return { success = false, message = _L("financing_credit_score_too_low", required, score) }
+            end
+        end
+
+        local upfrontTotal = downPayment + addonCost
+        local playerMoney = GetMoney(source, paymentMethod)
+        if playerMoney < upfrontTotal then
+            ReleaseStockLock(stockId, transaction)
+            return { success = false, message = "Insufficient funds for down payment." }
+        end
+
+        -- Calculate financing details
+        local remainingBalance = price - downPayment
+        local interestRate = settings.interestRate / 100
+        local totalWithInterest = remainingBalance + math.floor(remainingBalance * interestRate)
+        local installmentAmount = math.ceil(totalWithInterest / installments)
+
+        -- Deduct down payment + addon cost from the selected account
+        if RemoveMoney(source,upfrontTotal,paymentMethod)~=true then ReleaseStockLock(stockId, transaction); return {success=false,message="Payment rejected"} end
+
+        -- Register vehicle with a single, authoritative plate (matches the sales flow
+        -- so GetOwnedVehicleFromPlate resolves correctly for repossession / seize).
+        local isUsed = stockItem.is_used == 1 or stockItem.is_used == true
+        local plate
+        local properties
+        if isUsed and stockItem.plate and stockItem.plate ~= '' then
+            plate = stockItem.plate
+            properties = stockItem.metadata
+            if type(properties) == "string" then properties = json.decode(properties) or {} end
+            if type(properties) ~= "table" then properties = {} end
+            properties.plate = plate
+        else
+            plate = customPlate or GeneratePlate()
+            properties = { plate = plate }
+        end
+        if AddOwnedVehicleWithProps(source,stockItem.vehicle_model,plate,properties)~=true then
+            if GetIdentifier(source) == identifier then AddMoney(source, upfrontTotal, paymentMethod) end
+            return {success=false, message='Vehicle ownership insert rejected.'}
+        end
 
 
-    -- Sales tax
-    local salesTax = math.floor(price * (Config.SalesTax or 0))
-    local netDownPayment = downPayment - math.floor(downPayment * (Config.SalesTax or 0))
 
-    -- Add-on revenue (custom plate fee, etc.) goes straight to the
-    -- dealership balance — no commission, no sales tax handling.
-    AddDealershipBalance(dealershipId, netDownPayment + addonCost)
-    MarkStockSold(stockId, identifier, nil)
-    ReleaseStockLock(stockId)
+        -- Sales tax
+        local salesTax = math.floor(price * (Config.SalesTax or 0))
+        local netDownPayment = downPayment - math.floor(downPayment * (Config.SalesTax or 0))
 
-    -- Calculate next payment time
-    local paymentIntervalSeconds = (settings.paymentIntervalHours or 24) * 3600
-    local nextPaymentTimestamp = os.time() + paymentIntervalSeconds
+        -- Add-on revenue (custom plate fee, etc.) goes straight to the
+        -- dealership balance — no commission, no sales tax handling.
+        AddDealershipBalance(dealershipId, netDownPayment + addonCost)
+        MarkStockSold(stockId, identifier, nil)
+        ReleaseStockLock(stockId, transaction)
 
-    MySQL.insert.await(
-        "INSERT INTO `pickle_dealership_financing` (`dealership_id`, `identifier`, `vehicle_plate`, `total_amount`, `amount_paid`, `installment_amount`, `interest_rate`, `next_payment`, `status`) VALUES (?, ?, ?, ?, ?, ?, ?, FROM_UNIXTIME(?), 'active')",
-        {
-            dealershipId,
-            identifier,
-            string.upper(plate),
-            totalWithInterest,
-            0,
-            installmentAmount,
-            settings.interestRate,
-            nextPaymentTimestamp,
+        -- Calculate next payment time
+        local paymentIntervalSeconds = (settings.paymentIntervalHours or 24) * 3600
+        local nextPaymentTimestamp = os.time() + paymentIntervalSeconds
+
+        MySQL.insert.await(
+            "INSERT INTO `pickle_dealership_financing` (`dealership_id`, `identifier`, `vehicle_plate`, `total_amount`, `amount_paid`, `installment_amount`, `interest_rate`, `next_payment`, `status`) VALUES (?, ?, ?, ?, ?, ?, ?, FROM_UNIXTIME(?), 'active')",
+            {
+                dealershipId,
+                identifier,
+                string.upper(plate),
+                totalWithInterest,
+                0,
+                installmentAmount,
+                settings.interestRate,
+                nextPaymentTimestamp,
+            }
+        )
+
+        AddLedgerEntry(dealershipId, "sale", price, ("Financed vehicle: %s (down: %s)"):format(stockItem.vehicle_label or stockItem.vehicle_model, GetCurrencyString(downPayment)), identifier)
+        if salesTax > 0 then
+            AddLedgerEntry(dealershipId, "tax", -salesTax, ("Sales tax on financed %s"):format(stockItem.vehicle_label or stockItem.vehicle_model), nil)
+        end
+        if couponRow then
+            AddLedgerEntry(dealershipId, "discount", -couponDiscount, ("Coupon %s applied to financed %s"):format(couponRow.code or "?", stockItem.vehicle_label or stockItem.vehicle_model), identifier)
+        end
+
+        -- Burn the inventory coupon item, if the customer redeemed one from the
+        -- picker rather than typing a raw code. The discount itself was already
+        -- consumed atomically inside ValidateCoupon.
+        if data.couponCode and data.couponCode ~= "" and data.couponItemSlot then
+            ConsumeCouponItem(source, data.couponItemSlot)
+        end
+
+        return {
+            success = true,
+            plate = plate,
+            model = stockItem.vehicle_model,
+            label = stockItem.vehicle_label or stockItem.vehicle_model,
+            isUsed = isUsed,
+            properties = isUsed and stockItem.metadata or nil,
+            downPayment = downPayment,
+            installmentAmount = installmentAmount,
+            totalInstallments = installments,
+            totalWithInterest = totalWithInterest,
+            location = dealership.location,
         }
-    )
-
-    AddLedgerEntry(dealershipId, "sale", price, ("Financed vehicle: %s (down: %s)"):format(stockItem.vehicle_label or stockItem.vehicle_model, GetCurrencyString(downPayment)), identifier)
-    if salesTax > 0 then
-        AddLedgerEntry(dealershipId, "tax", -salesTax, ("Sales tax on financed %s"):format(stockItem.vehicle_label or stockItem.vehicle_model), nil)
-    end
-    if couponRow then
-        AddLedgerEntry(dealershipId, "discount", -couponDiscount, ("Coupon %s applied to financed %s"):format(couponRow.code or "?", stockItem.vehicle_label or stockItem.vehicle_model), identifier)
-    end
-
-    -- Burn the inventory coupon item, if the customer redeemed one from the
-    -- picker rather than typing a raw code. The discount itself was already
-    -- consumed atomically inside ValidateCoupon.
-    if data.couponCode and data.couponCode ~= "" and data.couponItemSlot then
-        ConsumeCouponItem(source, data.couponItemSlot)
-    end
-
-    return {
-        success = true,
-        plate = plate,
-        model = stockItem.vehicle_model,
-        label = stockItem.vehicle_label or stockItem.vehicle_model,
-        isUsed = isUsed,
-        properties = isUsed and stockItem.metadata or nil,
-        downPayment = downPayment,
-        installmentAmount = installmentAmount,
-        totalInstallments = installments,
-        totalWithInterest = totalWithInterest,
-        location = dealership.location,
-    }
+    end)
 end)
 
 -- ─── Make Payment ───────────────────────────────────────────────────────────
 
 lib.callback.register("pickle_dealerships:makePayment", function(source, data)
-    local financingId = tonumber(data.financingId)
-    if not financingId then
-        return { success = false, message = "Invalid request." }
-    end
+    return DealerTransaction(source, function(transaction)
+        if type(data) ~= 'table' then return {success=false, message='Invalid request.'} end
+        local financingId = tonumber(data.financingId)
+        if not financingId then
+            return { success = false, message = "Invalid request." }
+        end
 
-    local identifier = GetIdentifier(source)
-    if not identifier then
-        return { success = false, message = "Could not identify player." }
-    end
+        local identifier = GetIdentifier(source)
+        if not identifier then
+            return { success = false, message = "Could not identify player." }
+        end
 
-    local rows = MySQL.query.await(
-        "SELECT * FROM `pickle_dealership_financing` WHERE `id` = ? AND `identifier` = ? AND `status` = 'active' LIMIT 1",
-        { financingId, identifier }
-    )
-    local financing = rows and rows[1] or nil
-    if not financing then
-        return { success = false, message = "Financing agreement not found or already completed." }
-    end
-
-    local paymentAmount = financing.installment_amount
-    local remaining = financing.total_amount - financing.amount_paid
-
-    if paymentAmount > remaining then
-        paymentAmount = remaining
-    end
-
-    local playerMoney = GetMoney(source, "bank")
-    if playerMoney < paymentAmount then
-        return { success = false, message = "Insufficient funds for payment." }
-    end
-
-    RemoveMoney(source, paymentAmount, "bank")
-
-    local newAmountPaid = financing.amount_paid + paymentAmount
-    local fullyPaid = newAmountPaid >= financing.total_amount
-
-    local netPayment = paymentAmount - math.floor(paymentAmount * (Config.SalesTax or 0))
-    AddDealershipBalance(financing.dealership_id, netPayment)
-
-    local settings = GetFinancingSettings(financing.dealership_id)
-    local paymentIntervalSeconds = (settings.paymentIntervalHours or 24) * 3600
-    local nextPaymentTimestamp = os.time() + paymentIntervalSeconds
-
-    if fullyPaid then
-        MySQL.update.await(
-            "UPDATE `pickle_dealership_financing` SET `amount_paid` = ?, `status` = 'paid', `missed_payments` = 0 WHERE `id` = ?",
-            { newAmountPaid, financingId }
+        local rows = MySQL.query.await(
+            "SELECT * FROM `pickle_dealership_financing` WHERE `id` = ? AND `identifier` = ? AND `status` = 'active' LIMIT 1",
+            { financingId, identifier }
         )
-        AddLedgerEntry(financing.dealership_id, "financing_payment", paymentAmount, ("Final financing payment for plate %s"):format(financing.vehicle_plate), identifier)
-    else
-        MySQL.update.await(
-            "UPDATE `pickle_dealership_financing` SET `amount_paid` = ?, `next_payment` = FROM_UNIXTIME(?), `missed_payments` = 0 WHERE `id` = ?",
-            { newAmountPaid, nextPaymentTimestamp, financingId }
-        )
-        AddLedgerEntry(financing.dealership_id, "financing_payment", paymentAmount, ("Financing payment for plate %s"):format(financing.vehicle_plate), identifier)
-    end
+        local financing = rows and rows[1] or nil
+        if not financing then
+            return { success = false, message = "Financing agreement not found or already completed." }
+        end
 
-    return {
-        success = true,
-        amountPaid = paymentAmount,
-        totalPaid = newAmountPaid,
-        remaining = financing.total_amount - newAmountPaid,
-        fullyPaid = fullyPaid,
-    }
+        local paymentAmount = financing.installment_amount
+        local remaining = financing.total_amount - financing.amount_paid
+
+        if paymentAmount > remaining then
+            paymentAmount = remaining
+        end
+
+        local playerMoney = GetMoney(source, "bank")
+        if playerMoney < paymentAmount then
+            return { success = false, message = "Insufficient funds for payment." }
+        end
+
+        RemoveMoney(source, paymentAmount, "bank")
+
+        local newAmountPaid = financing.amount_paid + paymentAmount
+        local fullyPaid = newAmountPaid >= financing.total_amount
+
+        local netPayment = paymentAmount - math.floor(paymentAmount * (Config.SalesTax or 0))
+        AddDealershipBalance(financing.dealership_id, netPayment)
+
+        local settings = GetFinancingSettings(financing.dealership_id)
+        local paymentIntervalSeconds = (settings.paymentIntervalHours or 24) * 3600
+        local nextPaymentTimestamp = os.time() + paymentIntervalSeconds
+
+        if fullyPaid then
+            MySQL.update.await(
+                "UPDATE `pickle_dealership_financing` SET `amount_paid` = ?, `status` = 'paid', `missed_payments` = 0 WHERE `id` = ?",
+                { newAmountPaid, financingId }
+            )
+            AddLedgerEntry(financing.dealership_id, "financing_payment", paymentAmount, ("Final financing payment for plate %s"):format(financing.vehicle_plate), identifier)
+        else
+            MySQL.update.await(
+                "UPDATE `pickle_dealership_financing` SET `amount_paid` = ?, `next_payment` = FROM_UNIXTIME(?), `missed_payments` = 0 WHERE `id` = ?",
+                { newAmountPaid, nextPaymentTimestamp, financingId }
+            )
+            AddLedgerEntry(financing.dealership_id, "financing_payment", paymentAmount, ("Financing payment for plate %s"):format(financing.vehicle_plate), identifier)
+        end
+
+        return {
+            success = true,
+            amountPaid = paymentAmount,
+            totalPaid = newAmountPaid,
+            remaining = financing.total_amount - newAmountPaid,
+            fullyPaid = fullyPaid,
+        }
+    end)
 end)
 
 -- ─── Get My Financing ───────────────────────────────────────────────────────
@@ -510,29 +536,32 @@ end)
 -- ─── Owner: Forgive Loan ───────────────────────────────────────────────────
 
 lib.callback.register("pickle_dealerships:forgiveLoan", function(source, data)
-    local financingId = tonumber(data and data.financingId)
-    local dealershipId = tonumber(data and data.dealershipId)
-    if not financingId or not dealershipId then return false, "Invalid request." end
+    return DealerTransaction(source, function(transaction)
+        if type(data) ~= 'table' then return false, 'Invalid request.' end
+        local financingId = tonumber(data and data.financingId)
+        local dealershipId = tonumber(data and data.dealershipId)
+        if not financingId or not dealershipId then return false, "Invalid request." end
 
-    local role = GetPlayerDealershipRole(source, dealershipId)
-    if role ~= 'owner' and not IsPlayerAdmin(source) then
-        return false, "Only owners can forgive loans."
-    end
+        local role = GetPlayerDealershipRole(source, dealershipId)
+        if role ~= 'owner' and not IsPlayerAdmin(source) then
+            return false, "Only owners can forgive loans."
+        end
 
-    local rows = MySQL.query.await(
-        "SELECT * FROM `pickle_dealership_financing` WHERE `id` = ? AND `dealership_id` = ? AND `status` = 'active' LIMIT 1",
-        { financingId, dealershipId }
-    )
-    if not rows or not rows[1] then return false, "Agreement not found." end
+        local rows = MySQL.query.await(
+            "SELECT * FROM `pickle_dealership_financing` WHERE `id` = ? AND `dealership_id` = ? AND `status` = 'active' LIMIT 1",
+            { financingId, dealershipId }
+        )
+        if not rows or not rows[1] then return false, "Agreement not found." end
 
-    MySQL.update.await(
-        "UPDATE `pickle_dealership_financing` SET `status` = 'paid', `amount_paid` = `total_amount`, `missed_payments` = 0 WHERE `id` = ?",
-        { financingId }
-    )
+        MySQL.update.await(
+            "UPDATE `pickle_dealership_financing` SET `status` = 'paid', `amount_paid` = `total_amount`, `missed_payments` = 0 WHERE `id` = ?",
+            { financingId }
+        )
 
-    AddLedgerEntry(dealershipId, "loan_forgiven", 0, ("Loan forgiven for plate %s by owner"):format(rows[1].vehicle_plate), GetIdentifier(source))
+        AddLedgerEntry(dealershipId, "loan_forgiven", 0, ("Loan forgiven for plate %s by owner"):format(rows[1].vehicle_plate), GetIdentifier(source))
 
-    return true
+        return true
+    end, true)
 end)
 
 -- ─── Financing Check Thread (Overdue Payments) ─────────────────────────────
